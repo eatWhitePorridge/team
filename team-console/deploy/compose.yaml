@@ -1,0 +1,58 @@
+name: team-console
+services:
+  web:
+    build:
+      context: ./source
+      dockerfile: team-console/Dockerfile
+    image: ${TEAM_CONSOLE_IMAGE:-team-console:local}
+    container_name: team-console
+    restart: unless-stopped
+    init: true
+    user: '10001:10001'
+    ports:
+      - '${TEAM_CONSOLE_BIND:-0.0.0.0}:${TEAM_CONSOLE_PUBLISHED_PORT:-5050}:5050'
+    environment:
+      TZ: Asia/Shanghai
+      TEAM_CONSOLE_HOST: 0.0.0.0
+      TEAM_CONSOLE_PORT: '5050'
+      TEAM_CONSOLE_DATA_DIR: /data
+      TEAM_CONSOLE_HTTP_THREADS: '16'
+      TEAM_CONSOLE_AUTH_WORKERS: '100'
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./business.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.console.env
+        target: /app/team-console/.env
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    cpus: 4.0
+    mem_limit: 4g
+    memswap_limit: 5g
+    pids_limit: 2048
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'

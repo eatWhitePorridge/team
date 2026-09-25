@@ -1,0 +1,57 @@
+# Local configuration and secrets
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# Runtime state, credentials, logs and captures
+/data/
+team-console/data/*
+!team-console/data/.gitkeep
+account_cookies/
+codex_accounts/
+codex_agent_accounts/
+注册日志/
+注册任务*.json
+注册成功*.json
+注册成功*.txt
+注册批次*.json
+用于注册*.json
+用于注册*.txt
+邮箱分配记录.json
+一键补全任务.json
+codex_导出状态.json
+accounts_viewer.html
+*.sqlite*
+*.db
+*.log
+*.har
+*.bak
+*.tmp
+sentinel.config.json
+sentinel-challenge-*.json
+
+# Reproducible dependencies and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.local.*

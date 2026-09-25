@@ -1,0 +1,10 @@
+data/*
+!data/.gitkeep
+__pycache__/
+backend/__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/*.tsbuildinfo
+.env
+.console.env
+business.env
