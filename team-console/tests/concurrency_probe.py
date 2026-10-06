@@ -20,7 +20,7 @@ def main():
     from backend.services import load_services
     from backend.app import create_app
     services = load_services()
-    from core import codex_retry_service as retry, codex_oauth, registration_service
+    from core import codex_retry_service as retry, codex_oauth, registration_service, progress_events
     from config import codex
     import config
 
@@ -35,6 +35,7 @@ def main():
 
     def oauth(email, **kwargs):
         nonlocal peak
+        progress_events.phase('mfa')
         assert kwargs['login_mode'] == 'password_totp'
         mode = 'ordinary' if kwargs.get('auto_retry', True) else 'team'
         with condition:
@@ -68,8 +69,22 @@ def main():
         assert pool._max_workers == workers
         with patch.object(registration_service, 'get_executor', wraps=registration_service.get_executor) as executor_route:
             app = create_app(services=services, api_key='fixture-key')
+            feed = app.extensions['team_console']['progress']
+            feed.start()
             client = app.test_client()
             headers = {'X-Team-Console-Key':'fixture-key'}
+            def live_status(queued, *, phases=None):
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    data = client.get('/api/jobs', headers=headers).get_json()
+                    # Runtime counts may reach 100 in an earlier feed snapshot
+                    # than the 100th worker's phase event. Wait for BOTH within
+                    # the same bounded deadline, not just executor counts.
+                    ready = phases is None or sum(row.get('progress_stage') == 'mfa' for row in data['pipeline']) == phases
+                    if data['runtime']['running'] == 100 and data['runtime']['queued'] == queued and ready:
+                        return data
+                    time.sleep(0.01)
+                raise AssertionError('event-driven runtime did not update')
             imported = client.post('/api/accounts/import-password-totp', headers=headers, json={
                 'text':'\n'.join(f'{email}----FixturePassword123!----JBSWY3DPEHPK3PXP' for email in emails),
             })
@@ -82,14 +97,17 @@ def main():
                     assert response.status_code == 202 and response.get_json()['started_count'] == 60
                 assert services.completion._scheduler_tick() == 120
                 await_entries(100)
-                first = client.get('/api/jobs', headers=headers).get_json()['runtime']
+                first_snapshot = live_status(20, phases=100)
+                first = first_snapshot['runtime']
+                assert len(first_snapshot['pipeline']) == 120, 'active work must not be truncated to 100'
+                assert sum(row.get('progress_stage') == 'mfa' for row in first_snapshot['pipeline']) == 100
                 assert first['workers'] == first['running'] == first['peak_running'] == workers, first
                 assert first['queued'] == 20 and len(entered) == 100, first
                 assert modes == {'ordinary', 'team'}
                 ramp = time.monotonic() - started
                 gates[emails[0]].set()
                 await_entries(101)
-                second = client.get('/api/jobs', headers=headers).get_json()['runtime']
+                second = live_status(19)['runtime']
                 assert second['running'] == 100 and second['queued'] == 19, second
                 assert sum(gate.is_set() for gate in gates.values()) == 1
                 assert peak == 100
@@ -107,6 +125,7 @@ def main():
             finally:
                 for gate in gates.values(): gate.set()
                 retry.shutdown_executor(wait=True)
+                feed.stop()
     print(json.dumps(report), flush=True)
 
     # Futures cancelled before start, exceptions and failed submit cannot leak

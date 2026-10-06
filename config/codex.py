@@ -43,6 +43,8 @@ CODEX_FLOW_MAX_ATTEMPTS: int = 3
 CODEX_FLOW_RETRY_DELAY: float = 2.0
 
 # 提交邮箱之前可以低成本筛选更多代理；这些失败不会发送 OTP 或购买号码。
+# network_preflight 的 ProxyError 单独计数，两种授权均生效；耗尽即停止，
+# 不消耗业务重试预算，也不由 Team 外层再乘以业务重试次数。
 CODEX_PROXY_PREFLIGHT_MAX_ATTEMPTS: int = 10
 
 # 换下一条预检代理前的固定短等待。坏 SOCKS 会话会立即切换，不在原会话反复等待。
@@ -52,9 +54,10 @@ CODEX_PROXY_PREFLIGHT_RETRY_DELAY: float = 0.5
 # 显式直连（proxy=""）始终保持直连，不会被切到代理池。
 CODEX_ROTATE_PROXY_ON_RETRY: bool = True
 
-# Codex 协议 HTTP/TLS 浏览器画像。Firefox 不发送 Chromium Client Hints，且
-# 与 curl_cffi firefox147 的 TLS/HTTP2 指纹保持一致。
-CODEX_BROWSER_FAMILY: str = "firefox"
+# 仅 Codex 协议授权：chrome 选择参考仓库画像（chrome146 TLS + Chrome 149
+# HTTP/JS、出口 GeoIP 语言时区）；firefox 可回退，chrome146 保留原一致画像。
+# 保持默认值 chrome 可被尚未重启的旧工作线程识别；完整参考画像在重启后生效。
+CODEX_BROWSER_FAMILY: str = "chrome"
 
 
 # ============================================================

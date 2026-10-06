@@ -5,10 +5,12 @@ import { RequestError } from './components';
 import { useAction, useResource } from './hooks';
 import { workspaceSeats } from './teamSeats';
 import type { Parent, TeamOperationPreview, TeamScope, Workspace } from './types';
+import { useIsMobile } from './useResponsive';
 
 export default function TeamOperationModal({ kind, scope, onClose, onSubmitted }: {
   kind: 'switch' | 'remove'; scope: TeamScope; onClose: () => void; onSubmitted: () => void;
 }) {
+  const mobile = useIsMobile();
   const parents = useResource<{ items: Parent[] }>('/api/team-admin/parents');
   const [parentId, setParentId] = useState<number>();
   const [workspaceId, setWorkspaceId] = useState<string>();
@@ -35,7 +37,7 @@ export default function TeamOperationModal({ kind, scope, onClose, onSubmitted }
     void action.message.success('已入队 ' + current.eligible_count + ' 个成员');
     onSubmitted(); onClose();
   });
-  return <Modal open title={kind === 'switch' ? '切换 Team 席位' : '移出 Team'} width={720} onCancel={() => { if (!action.pending) onClose(); }} footer={<Space wrap>
+  return <Modal open title={kind === 'switch' ? '切换 Team 席位' : '移出 Team'} width={720} onCancel={() => { if (!action.pending) onClose(); }} footer={<Space size={16} wrap className="operation-footer">
     <Button onClick={onClose} disabled={action.pending}>取消</Button><Button onClick={() => void inspect()} disabled={!ready || action.pending}>预览成员</Button>
     <Button type="primary" danger={kind === 'remove'} loading={action.pending} disabled={!ready || !current?.eligible_count} onClick={() => void submit()}>确认{kind === 'switch' ? '切换' : '移出'}</Button>
   </Space>}>
@@ -47,9 +49,8 @@ export default function TeamOperationModal({ kind, scope, onClose, onSubmitted }
       {kind === 'switch' && <Form.Item label="目标席位"><Select value={seat} options={seats} disabled={!workspace || action.pending} onChange={setSeat} /></Form.Item>}
     </Form>
     {!!parent?.active_job_id && <Alert className="notice" type="warning" message="母号任务执行中，请稍后操作。" />}
-    <details className="inline-details"><summary>匹配规则</summary><p className="muted details-body">按授权中的成员 ID 匹配，无邮箱也可处理。跳过其他工作区、缺少 ID 和母号自身；先预览，再确认。</p></details>
     {current && <><div className="preview-summary"><strong>可处理 {current.eligible_count} 人</strong><span className="muted">跳过 {current.skipped_count} 人</span></div>
-      <Table rowKey="account_id" size="small" dataSource={current.items} scroll={{ x: 620, y: 280 }} pagination={{ pageSize: 10, hideOnSinglePage: true }} columns={[{ title: '账号', dataIndex: 'email', width: 230, ellipsis: true }, { title: '成员 ID', dataIndex: 'user_id', width: 150, ellipsis: true }, { title: '说明', dataIndex: 'message' }]} />
+      <Table rowKey="account_id" size="small" dataSource={current.items} scroll={mobile ? { y: 280 } : { x: 620, y: 280 }} pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false, simple: mobile ? { readOnly: true } : false }} columns={mobile ? [{ title: '匹配结果', render: (_, row) => <div className="compact-record"><Typography.Text className="record-identity">{row.email || '账号 ' + row.account_id}</Typography.Text><span className="record-meta">成员 ID：{row.user_id || '—'}</span><span className="record-meta">{row.message}</span></div> }] : [{ title: '账号', dataIndex: 'email', width: 230, ellipsis: true }, { title: '成员 ID', dataIndex: 'user_id', width: 150, ellipsis: true }, { title: '说明', dataIndex: 'message' }]} />
     </>}
   </Modal>;
 }

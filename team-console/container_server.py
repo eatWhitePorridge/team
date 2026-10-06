@@ -21,11 +21,20 @@ def main():
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s')
-    from waitress import serve
     from server import app
+    run(app)
+
+
+def run(app):
+    import uvicorn
+    from backend.asgi import ConsoleASGI
+    options = server_options()
     # Do not use multiple WSGI processes: locks, queues and JSON caches are
     # process-local. The imported entrypoint starts exactly one index writer.
-    serve(app, **server_options())
+    uvicorn.run(ConsoleASGI(app, threads=options['threads'], max_body=options['max_request_body_size']),
+                host=options['host'], port=options['port'], workers=1,
+                loop='asyncio', http='h11', ws='none', lifespan='on',
+                proxy_headers=False, access_log=False, timeout_graceful_shutdown=30)
 
 
 if __name__ == '__main__':

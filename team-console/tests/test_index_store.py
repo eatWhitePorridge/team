@@ -38,6 +38,39 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(result['codex_connection_state'], 'connected')
         self.assertEqual(result['totp_status'], 'active')
 
+    def test_confirmed_ban_overrides_preserved_token_and_filters(self):
+        self.rows[0].update(codex_status='deactivated', codex_refresh_token='FIXTURE_SECRET')
+        self.rows[1].update(codex_status='failed', codex_error_code='account_banned', codex_refresh_token='FIXTURE_SECRET')
+        self.rows[2].update(codex_status='failed', codex_error='HTTP 403 cf challenge')
+        self.write_rows(); self.index.refresh_if_stale()
+        result = self.index.query(codex_state='deactivated', page_size=1)
+        self.assertEqual(result['total'], 2)
+        self.assertEqual(result['items'][0]['codex_connection_state'], 'deactivated')
+        self.assertTrue(result['items'][0]['has_codex_refresh_token'])
+        self.assertNotIn('FIXTURE_SECRET', json.dumps(result))
+        self.assertEqual(self.index.summary()['codex_connected'], 0)
+        self.assertEqual(self.index.query(codex_state='not_connected')['total'], 4)
+        # Survives process restart and a fresh projection of historical data.
+        restarted = AccountIndex(self.source, self.path)
+        restarted.refresh_if_stale()
+        self.assertEqual(restarted.query(codex_state='deactivated')['total'], 2)
+
+    def test_ban_progress_journal_cannot_be_masked_by_old_token(self):
+        self.rows[0].update(codex_refresh_token='FIXTURE_SECRET', codex_status='success')
+        self.write_rows(); self.index.refresh_if_stale()
+        self.assertEqual(self.index.get(1)['codex_connection_state'], 'connected')
+        self.journal({'codex_status': 'deactivated', 'codex_error_code': 'account_deactivated'})
+        self.index.refresh_if_stale()
+        self.assertEqual(self.index.get(1)['codex_connection_state'], 'deactivated')
+
+    def test_generic_403_and_unrecognized_error_codes_are_not_account_bans(self):
+        for row in [dict(codex_status='failed', codex_error='HTTP 403'),
+                    dict(codex_status='retrying', codex_error_code='cf_challenge'),
+                    dict(codex_status='failed', codex_error_code='PRIVATE_VALUE')]:
+            result = safe_projection(dict(id=7, email='example@example.invalid', **row))
+            self.assertNotEqual(result['codex_connection_state'], 'deactivated')
+            self.assertIsNone(result['codex_error_code'])
+
     def test_pagination_and_literal_search(self):
         result = self.index.query(page=2, page_size=2)
         self.assertEqual([row['id'] for row in result['items']], [4, 3])
@@ -52,6 +85,40 @@ class IndexTests(unittest.TestCase):
             self.assertEqual(self.index.get(1)['id'], 1)
             self.assertEqual(self.batches.query()['items'][0]['account_total'], 6)
         self.index.loader.assert_not_called()
+
+    def test_workspace_email_scope_is_complete_before_summary_and_pagination(self):
+        self.rows[1].update(archived=True)
+        self.rows[2].update(codex_plan_type='free')
+        self.rows[4].update(codex_plan_type='free')
+        self.write_rows(); self.index.refresh_if_stale()
+        emails = {'USER_1@example.invalid', 'user_2@example.invalid', 'user_3@example.invalid', ' user_5@example.invalid ', ''}
+        self.index.loader = Mock(side_effect=AssertionError('workspace scanned JSON'))
+        with patch.object(self.index, 'refresh_if_stale', side_effect=AssertionError('blocking refresh')):
+            result = self.index.query(email_scope=emails, page=2, page_size=1)
+            self.assertEqual(result['total'], 3)
+            self.assertEqual(result['summary']['total'], 3)
+            self.assertEqual([row['id'] for row in result['items']], [3])
+            self.assertEqual(self.index.query(email_scope=emails, codex_plan_type='free')['total'], 2)
+            self.assertEqual(self.index.query(email_scope=emails, batch_id='missing')['total'], 0)
+            self.assertEqual(self.index.query(email_scope=emails, q='user_5')['total'], 1)
+        self.index.loader.assert_not_called()
+
+    def test_empty_or_large_email_scope_never_broadens_or_leaks_to_next_query(self):
+        # Well beyond common SQLite placeholder limits, with duplicate emails.
+        emails = [f'missing{i}@example.invalid' for i in range(40000)] + ['USER_1@example.invalid'] * 3
+        self.assertEqual(self.index.query(email_scope=emails)['total'], 1)
+        self.assertEqual(self.index.query(email_scope=set())['total'], 0)
+        self.assertEqual(self.index.query(email_scope=["' OR 1=1 --"])['total'], 0)
+        self.assertEqual(self.index.query()['total'], 6)
+
+    def test_parallel_workspace_queries_use_connection_local_scopes(self):
+        from concurrent.futures import ThreadPoolExecutor
+        def query(i):
+            result = self.index.query(email_scope=[f'user_{i}@example.invalid'])
+            return [row['id'] for row in result['items']]
+        with ThreadPoolExecutor(max_workers=6) as workers:
+            results = list(workers.map(query, range(1, 7)))
+        self.assertEqual(results, [[i] for i in range(1, 7)])
 
     def test_authorization_plan_filter_is_exact_and_does_not_guess_free(self):
         self.rows[0].update(codex_plan_type=' FREE ', plan_type='team')
@@ -113,6 +180,37 @@ class IndexTests(unittest.TestCase):
         self.assertFalse(row['has_codex_refresh_token'])
         self.assertNotIn('FIXTURE_SECRET', json.dumps(row))
 
+    def test_merge_membership_journal_updates_filters_and_survives_index_rebuild(self):
+        self.journal({'registration_batch_id': 'batch2'})
+        self.index.refresh_if_stale()
+        self.assertEqual(self.index.query(batch_id='batch1')['total'], 5)
+        self.assertEqual(self.index.query(batch_id='batch2')['items'][0]['id'], 1)
+        fresh = AccountIndex(self.source, self.root / 'rebuild.sqlite3')
+        fresh.refresh_if_stale()
+        self.assertEqual(fresh.query(batch_id='batch2')['total'], 1)
+        self.journal({'registration_batch_id': {'secret': 'malformed'}})
+        self.index.refresh_if_stale()
+        self.assertEqual(self.index.get(1)['registration_batch_id'], 'batch1')
+
+    def test_batch_merge_updates_membership_and_counts_together_without_loading_json(self):
+        target = safe_batch_projection({'batch_id': 'batch2', 'updated_at': '2026-01-02',
+                                        'flow_snapshot': {'registration_driver': 'imported'}})
+        with patch.object(self.index, 'loader', side_effect=AssertionError('sync full JSON read')), \
+             patch.object(self.batches, 'loader', side_effect=AssertionError('sync full JSON read')):
+            self.indexer.apply_batch_merge({'target_batch_id': 'batch2', 'merged_batch_ids': ['batch1']}, target)
+        self.assertEqual(self.index.query(batch_id='batch1')['total'], 0)
+        self.assertEqual(self.index.query(batch_id='batch2')['total'], 6)
+        listing = self.batches.query(driver='imported')
+        self.assertEqual(listing['total'], 1)
+        self.assertEqual(listing['items'][0]['account_total'], 6)
+        self.assertEqual(self.batches.query(driver='roxy')['total'], 0)
+
+    def test_batch_cascade_updates_accounts_batch_rows_and_driver_index_together(self):
+        self.indexer.apply_batch_delete(['batch1'], [row['id'] for row in self.rows])
+        self.assertEqual(self.index.query()['total'], 0)
+        self.assertEqual(self.batches.query()['total'], 0)
+        self.assertEqual(self.batches.query(driver='roxy')['total'], 0)
+
     def test_journal_identity_and_signature_checked(self):
         self.journal({'quota_status': 'success'}, email='other@example.invalid')
         self.index.refresh_if_stale()
@@ -129,10 +227,50 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.index.get(1)['quota_status'], 'unchecked')
 
     def test_numeric_quota_values_do_not_trigger_false_updates(self):
-        self.rows[0].update(quota_primary_used_percent=0, quota_secondary_used_percent=10, quota_ok=True)
+        self.rows[0].update(quota_primary_used_percent=0, quota_secondary_used_percent=10, quota_ok=True,
+                            quota_credits_balance=0, quota_credits_has_credits=False, quota_credits_unlimited=False)
         self.write_rows()
         self.assertEqual(self.index.refresh_if_stale()['changed'], 1)
         self.assertEqual(self.index.refresh_if_stale(force=True)['changed'], 0)
+
+    def test_credit_journal_is_projected_to_all_read_paths_and_index_rebuild(self):
+        self.journal({'quota_status': 'success', 'quota_plan_type': 'self_serve_business_usage_based',
+                      'quota_credits_balance': '0', 'quota_credits_has_credits': False, 'quota_credits_unlimited': False,
+                      'quota_last_success_at': '2026-09-27T00:00:00Z', 'quota_allowed': None})
+        self.index.refresh_if_stale()
+        for row in (self.index.get(1), self.index.query(q='user_1')['items'][0],
+                    self.index.by_emails(['USER_1@example.invalid'])['user_1@example.invalid']):
+            self.assertEqual(row['quota_credits_balance'], 0)
+            self.assertEqual(row['quota_credits_unlimited'], 0)
+            self.assertIsNone(row['quota_primary_used_percent'])
+            self.assertEqual(row['quota_last_success_at'], '2026-09-27T00:00:00Z')
+        self.assertEqual(self.index.refresh_if_stale(force=True)['changed'], 0)
+        rebuilt = AccountIndex(self.source, self.root / 'rebuilt-credits.sqlite3')
+        rebuilt.refresh_if_stale()
+        self.assertEqual(rebuilt.get(1)['quota_credits_balance'], 0)
+
+    def test_credits_upgrade_adds_nullable_columns_without_inventing_old_balance(self):
+        legacy_path = self.root / 'legacy-index.sqlite3'
+        conn = sqlite3.connect(legacy_path)
+        try:
+            conn.execute('CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT, archived INTEGER)')
+            conn.execute("INSERT INTO accounts VALUES(1, 'old@example.invalid', 0)")
+            conn.commit()
+        finally:
+            conn.close()
+        upgraded = AccountIndex(self.source, legacy_path)
+        self.assertIsNone(upgraded.get(1)['quota_credits_balance'])
+        self.assertIsNone(upgraded.get(1)['quota_credits_unlimited'])
+        upgraded.refresh_if_stale()
+        self.assertEqual(upgraded.count(), 6)
+
+    def test_credits_projection_rejects_invalid_numbers_and_string_booleans(self):
+        for raw in (True, False, None, '', ' ', 'bad', float('nan'), float('inf'), {}, 10**400):
+            with self.subTest(raw=str(raw)[:20]):
+                self.assertIsNone(safe_projection({'quota_credits_balance': raw})['quota_credits_balance'])
+        self.assertEqual(safe_projection({'quota_credits_balance': '-1.25'})['quota_credits_balance'], -1.25)
+        self.assertIsNone(safe_projection({'quota_credits_unlimited': 'false'})['quota_credits_unlimited'])
+        self.assertIsNone(safe_projection({'quota_primary_used_percent': True})['quota_primary_used_percent'])
 
     def test_external_totp_in_active_filter(self):
         self.journal({'totp_status': 'active_external'})
@@ -171,6 +309,62 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(result['deleted'], 1)
         self.assertEqual(self.batches.query()['items'][0]['account_total'], 5)
         self.assertFalse(self.batches.refresh_if_stale()['refreshed'])
+
+    def test_explicit_delete_immediately_evicts_rows_without_scanning_source(self):
+        self.rows = self.rows[:-1]
+        self.write_rows()
+        with patch.object(self.index, 'loader', side_effect=AssertionError('synchronous full scan')):
+            self.index.remove_accounts([6])
+        self.assertEqual(self.index.query()['total'], 5)
+        self.assertIsNone(self.index.get(6))
+        self.assertEqual(self.batches.query()['items'][0]['account_total'], 5)
+        self.index.refresh_if_stale()
+        self.assertIsNone(self.index.get(6))
+
+    def test_eviction_waits_for_inflight_old_refresh_and_does_not_resurrect_rows(self):
+        entered, release, removed = threading.Event(), threading.Event(), threading.Event()
+        original = self.index.loader
+        failures = []
+
+        def old_loader():
+            snapshot = original()
+            entered.set()
+            release.wait(3)
+            return snapshot
+
+        def refresh():
+            try:
+                self.index.refresh_if_stale(force=True)
+            except RuntimeError:
+                # The source-signature check may already reject the old read.
+                pass
+            except Exception as exc:
+                failures.append(exc)
+
+        def evict():
+            self.index.remove_accounts([6])
+            removed.set()
+
+        with patch.object(self.index, 'loader', side_effect=old_loader):
+            refresher = threading.Thread(target=refresh)
+            remover = threading.Thread(target=evict)
+            refresher.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.rows = self.rows[:-1]
+                self.write_rows()
+                remover.start()
+                self.assertFalse(removed.wait(0.05))
+            finally:
+                release.set()
+                refresher.join(3)
+                if remover.ident is not None:
+                    remover.join(3)
+        self.assertFalse(failures)
+        self.assertTrue(removed.is_set())
+        self.assertIsNone(self.index.get(6))
+        self.assertIsNotNone(self.indexer.refresh_once())
+        self.assertIsNone(self.index.get(6))
 
     def test_batches_are_safe_correctly_classified_and_counted(self):
         result = self.batches.query(driver='roxy')

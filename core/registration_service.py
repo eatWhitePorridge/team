@@ -971,6 +971,7 @@ def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int
             _sync_registration_codex_parent(current, status="success", error="")
         else:
             message = str(result.get("message") or "Codex 补跑失败")[:500]
+            from core.account_state import unusable_account_code
             db.update_job(
                 job_id,
                 status="failed",
@@ -978,6 +979,11 @@ def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int
                 account_id=account_id,
                 error=message,
                 completed_at=now_iso,
+                codex_error_code=unusable_account_code(result),
+                codex_preflight_exhausted=bool(
+                    result.get("proxy_preflight_exhausted")
+                    and result.get("oauth_flow_attempts") == 0
+                ),
             )
             _sync_registration_codex_parent(current, status="not_connected", error=message)
     except Exception as exc:

@@ -11,6 +11,8 @@ def load_services():
         sys.path.insert(0, str(root))
     from core import db
     directory = bind_database(db, data_directory())
+    # Recover only a committed local batch split, never resume old OAuth jobs.
+    db._recover_registration_batch_split()
     from core import account_completion_service, quota_check_service, sub2api_export, team_admin_store
     from core import codex_retry_service, codex_oauth, account_cookie_store, http_diagnostics, account_export
     bind_service_paths(directory, completion=account_completion_service, retry=codex_retry_service,
@@ -23,6 +25,7 @@ def load_services():
     network = NetworkSettings(directory / 'network-settings.json', proxy, config)
     from .authorization_runtime import configure
     authorization = configure(codex_retry_service)
+    account_completion_service.configure_authorization_dispatch()
     from webui.team_admin_routes import blueprint
     # Register routes only. register_team_admin() also recovers old jobs and
     # resumes schedules; a second management surface must NEVER call it.

@@ -1,38 +1,44 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { App, List } from 'antd';
 import { ApiError, errorText, get } from './api';
+import { createPoller } from './polling';
+import type { PollInterval } from './polling';
 import type { Detail, QueueResult } from './types';
 
 // One request at a time; old responses cannot overwrite a new page/filter/scope.
-export function useResource<T>(url: string | null, params: Record<string, unknown> = {}, pollMs = 0) {
+export function useResource<T>(url: string | null, params: Record<string, unknown> = {}, pollMs: PollInterval<T> = 0) {
   const serialized = JSON.stringify(params);
   const key = JSON.stringify([url, serialized]);
-  const [revision, setRevision] = useState(0);
+  const refreshRef = useRef<() => void>(() => {});
   const [state, setState] = useState<{ key: string; data?: T; loading: boolean; error?: string }>({ key, loading: !!url });
-  const reload = useCallback(() => setRevision((n) => n + 1), []);
+  const reload = useCallback(() => refreshRef.current(), []);
   useEffect(() => {
-    let live = true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const controller = new AbortController();
     if (!url) { setState({ key, loading: false }); return; }
-    const load = async () => {
-      setState((old) => ({ key, data: old.key === key ? old.data : undefined, loading: true }));
-      try {
-        const data = await get<T>(url, JSON.parse(serialized), controller.signal);
-        if (live) setState({ key, data, loading: false });
-      } catch (error) {
-        if (live && !controller.signal.aborted) setState((old) => ({ ...old, key, loading: false, error: errorText(error) }));
-      } finally {
-        if (live && pollMs) timer = setTimeout(tick, pollMs);
-      }
+    const polling = typeof pollMs === 'function' || pollMs > 0;
+    const poller = createPoller<T>({
+      interval: pollMs, visible: !polling || !document.hidden,
+      read: (signal) => get<T>(url, JSON.parse(serialized), signal),
+      onStart: (manual) => setState((old) => !manual && old.key === key && old.data !== undefined ? old
+        : { key, data: old.key === key ? old.data : undefined, loading: true, error: old.key === key ? old.error : undefined }),
+      onData: (data) => setState({ key, data, loading: false }),
+      onError: (error) => setState((old) => ({ ...old, key, loading: false, error: errorText(error) })),
+    });
+    refreshRef.current = poller.refresh;
+    const onVisibility = () => poller.setVisible(!document.hidden);
+    if (polling) {
+      document.addEventListener('visibilitychange', onVisibility);
+      window.addEventListener('focus', poller.wake);
+      window.addEventListener('online', poller.wake);
+    }
+    poller.refresh();
+    return () => {
+      refreshRef.current = () => {};
+      poller.stop();
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', poller.wake);
+      window.removeEventListener('online', poller.wake);
     };
-    const tick = () => {
-      if (document.hidden) timer = setTimeout(tick, pollMs);
-      else void load();
-    };
-    void load();
-    return () => { live = false; controller.abort(); clearTimeout(timer); };
-  }, [url, serialized, key, revision, pollMs]);
+  }, [url, serialized, key, pollMs]);
   return { ...(state.key === key ? state : { loading: !!url, data: undefined, error: undefined }), reload };
 }
 
@@ -46,7 +52,7 @@ export function useAction() {
   };
   const queue = (result: QueueResult) => {
     const skipped = [...(result.busy || []), ...(result.skipped || []), ...(result.failed || []), ...(result.no_token || [])];
-    if (result.started_count > 0) void message.success('已入队 ' + result.started_count + ' 个任务');
+    if (result.started_count > 0) void message.success('已提交 ' + result.started_count + ' 个账号');
     else void message.warning(result.error || '没有新任务入队');
     details('未入队明细', skipped);
   };

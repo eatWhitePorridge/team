@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import secrets
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -11,6 +14,14 @@ from datetime import datetime, timezone
 from cryptography.fernet import Fernet, InvalidToken
 
 from core import db
+from core.team_proxy_url import normalize_proxy, masked_proxy
+
+# The console runs one WSGI process (container_server enforces workers=1).
+# Short critical sections protect binding changes against live transports,
+# including synchronous billing reads, not just queued jobs. No network I/O
+# runs under this lock; parent sessions and invitation forks remain concurrent.
+_PARENT_TRANSPORT_GUARD = threading.RLock()
+_PARENT_TRANSPORTS: dict[tuple[str, int], int] = {}
 
 
 class TeamAdminError(ValueError):
@@ -47,6 +58,11 @@ def connection():
             CREATE TABLE IF NOT EXISTS parents (
                 id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE,
                 data TEXT NOT NULL, credentials TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS parent_proxies (
+                parent_id INTEGER PRIMARY KEY REFERENCES parents(id) ON DELETE CASCADE,
+                encrypted TEXT NOT NULL, preview TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                revision TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS workspaces (
                 parent_id INTEGER NOT NULL REFERENCES parents(id) ON DELETE CASCADE,
@@ -86,6 +102,9 @@ def connection():
         """)
         with conn:
             yield conn
+        if conn.total_changes:
+            from core import progress_events
+            progress_events.notify('team')
     finally:
         conn.close()
 
@@ -118,8 +137,114 @@ def _idle(conn, parent_id: int):
         raise TeamAdminError("该母号已有任务，请等待完成或取消任务", code="parent_busy", status=409)
 
 
-def save_parent(email: str, fields: dict, credentials: dict | None, *, parent_id: int | None = None) -> dict:
-    with connection() as conn:
+def _proxy_public(conn, parent_id: int) -> dict:
+    row = conn.execute("SELECT preview,revision,source,updated_at FROM parent_proxies WHERE parent_id=?", (parent_id,)).fetchone()
+    return {"configured": True, **dict(row)} if row else {"configured": False, "preview": "", "revision": "", "source": "", "updated_at": ""}
+
+
+def _public_parent(conn, parent_id: int) -> dict:
+    return {**_parent(conn, parent_id), "proxy": _proxy_public(conn, parent_id)}
+
+
+def _transport_key(parent_id: int) -> tuple[str, int]:
+    return str(location().resolve()), parent_id
+
+
+def _transport_idle(parent_id: int):
+    if _PARENT_TRANSPORTS.get(_transport_key(parent_id), 0):
+        raise TeamAdminError("母号正在执行请求，请完成后再修改或删除", code="parent_busy", status=409)
+
+
+def _normalized_proxy(value) -> str:
+    try:
+        return normalize_proxy(value)
+    except ValueError as exc:
+        raise TeamAdminError(str(exc), code="invalid_proxy") from None
+
+
+def _pool_proxy(conn, *, exclude: str = "") -> str:
+    from config import proxy as proxy_config
+    candidates = []
+    for raw in list(proxy_config.PROXY_POOL):
+        try:
+            value = normalize_proxy(raw)
+        except ValueError:
+            continue
+        digest = hashlib.sha256(value.encode()).hexdigest()
+        if digest != exclude:
+            candidates.append((value, digest))
+    if not candidates:
+        raise TeamAdminError("代理池没有可绑定的代理，请手动指定或补充代理池；未回退直连", code="proxy_pool_empty", status=422)
+    used = {row[0] for row in conn.execute("SELECT fingerprint FROM parent_proxies")}
+    return secrets.choice([item for item in candidates if item[1] not in used] or candidates)[0]
+
+
+def _write_parent_proxy(conn, parent_id: int, value: str, source: str):
+    value = _normalized_proxy(value)
+    encrypted = _cipher().encrypt(value.encode()).decode()
+    conn.execute("""INSERT INTO parent_proxies VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(parent_id) DO UPDATE SET encrypted=excluded.encrypted, preview=excluded.preview,
+        fingerprint=excluded.fingerprint, revision=excluded.revision, source=excluded.source, updated_at=excluded.updated_at""",
+        (parent_id, encrypted, masked_proxy(value), hashlib.sha256(value.encode()).hexdigest(), uuid.uuid4().hex, source, now()))
+
+
+def set_parent_proxy(parent_id: int, *, expected_email: str, expected_revision: str, action: str, proxy=None) -> dict:
+    if action not in {"manual", "pool"}:
+        raise TeamAdminError("请选择手动指定或代理池分配", code="invalid_proxy_action")
+    value = _normalized_proxy(proxy) if action == "manual" else None
+    with _PARENT_TRANSPORT_GUARD, connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        parent = _parent(conn, parent_id)
+        if parent["email"] != expected_email or _proxy_public(conn, parent_id)["revision"] != expected_revision:
+            raise TeamAdminError("母号或代理已变化，请刷新后重新确认", code="parent_proxy_changed", status=409)
+        _idle(conn, parent_id)
+        _transport_idle(parent_id)
+        current = conn.execute("SELECT fingerprint FROM parent_proxies WHERE parent_id=?", (parent_id,)).fetchone()
+        if action == "pool":
+            value = _pool_proxy(conn, exclude=current[0] if current else "")
+        if not current or hashlib.sha256(value.encode()).hexdigest() != current[0]:
+            _write_parent_proxy(conn, parent_id, value, action)
+        return _public_parent(conn, parent_id)
+
+
+@contextmanager
+def parent_proxy_session(parent_id: int, *, expected_email: str):
+    """Bind once, then pin the encrypted URL until the caller closes its transport."""
+    key = _transport_key(parent_id)
+    with _PARENT_TRANSPORT_GUARD:
+        with connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            parent = _parent(conn, parent_id)
+            if parent["email"] != expected_email:
+                raise TeamAdminError("母号身份已变化，请刷新后重试", code="parent_changed", status=409)
+            row = conn.execute("SELECT encrypted FROM parent_proxies WHERE parent_id=?", (parent_id,)).fetchone()
+            if row:
+                try:
+                    value = normalize_proxy(_cipher().decrypt(row[0].encode()).decode())
+                except (InvalidToken, ValueError, OSError):
+                    raise TeamAdminError("母号固定代理无法解密或格式失效，请手动重新设置；未更换出口", code="parent_proxy_unreadable", status=422) from None
+            else:
+                value = _pool_proxy(conn)
+                _write_parent_proxy(conn, parent_id, value, "pool")
+        _PARENT_TRANSPORTS[key] = _PARENT_TRANSPORTS.get(key, 0) + 1
+    try:
+        yield value
+    finally:
+        with _PARENT_TRANSPORT_GUARD:
+            count = _PARENT_TRANSPORTS[key] - 1
+            if count:
+                _PARENT_TRANSPORTS[key] = count
+            else:
+                del _PARENT_TRANSPORTS[key]
+
+
+def save_parent(email: str, fields: dict, credentials: dict | None, *, parent_id: int | None = None, proxy: str | None = None) -> dict:
+    # Existing parents change proxies only through the identity/revision-guarded API.
+    if proxy is not None:
+        if parent_id is not None:
+            raise TeamAdminError("请通过固定代理设置修改代理")
+        proxy = _normalized_proxy(proxy)
+    with _PARENT_TRANSPORT_GUARD, connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if parent_id is None:
             fields = {**fields, "created_at": now(), "updated_at": now(), "status": "not_synced", "error": ""}
@@ -129,20 +254,23 @@ def save_parent(email: str, fields: dict, credentials: dict | None, *, parent_id
             except sqlite3.IntegrityError:
                 raise TeamAdminError("这个母号已添加", code="parent_exists", status=409) from None
             parent_id = cursor.lastrowid
+            if proxy is not None:
+                _write_parent_proxy(conn, parent_id, proxy, "manual")
         else:
             current = _parent(conn, parent_id)
             _idle(conn, parent_id)
+            _transport_idle(parent_id)
             current.update(fields, updated_at=now(), error="")
             if credentials is not None:
                 encrypted = _cipher().encrypt(_dump(credentials).encode()).decode()
                 conn.execute("UPDATE parents SET credentials=? WHERE id=?", (encrypted, parent_id))
             conn.execute("UPDATE parents SET data=? WHERE id=?", (_dump(current), parent_id))
-        return _parent(conn, parent_id)
+        return _public_parent(conn, parent_id)
 
 
 def get_parent(parent_id: int) -> dict:
     with connection() as conn:
-        return _parent(conn, parent_id)
+        return _public_parent(conn, parent_id)
 
 
 def credentials(parent_id: int) -> dict:
@@ -166,15 +294,40 @@ def list_parents() -> list[dict]:
     with connection() as conn:
         rows = conn.execute("SELECT id FROM parents ORDER BY id DESC").fetchall()
         active = {r["parent_id"]: r["id"] for r in conn.execute("SELECT parent_id,id FROM jobs WHERE status IN ('queued','running')")}
-        counts = {r[0]: r[1] for r in conn.execute("SELECT parent_id,COUNT(*) FROM workspaces GROUP BY parent_id")}
-        return [{**_parent(conn, r["id"]), "active_job_id": active.get(r["id"]), "workspace_count": counts.get(r["id"], 0)} for r in rows]
+        billing: dict[int, list[dict]] = {}
+        # One cache read for the whole navigator, never an upstream billing
+        # request per parent. Only project billing fields, not workspace data,
+        # member snapshots, entitlement expires_at or raw transport errors.
+        for row in conn.execute("SELECT parent_id,id,data FROM workspaces ORDER BY parent_id,id"):
+            try:
+                data = json.loads(row["data"])
+            except (ValueError, TypeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            summary = {"id": row["id"], "query_failed": bool(data.get("expiration_error"))}
+            if isinstance(data.get("name"), str):
+                summary["name"] = data["name"]
+            for key in ("renewal_date", "billing_renewal_date", "expiration_checked_at"):
+                value = data.get(key)
+                if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                    summary[key] = value
+            billing.setdefault(row["parent_id"], []).append(summary)
+        return [{**_public_parent(conn, r["id"]), "active_job_id": active.get(r["id"]),
+                 "workspace_count": len(billing.get(r["id"], [])),
+                 "billing_workspaces": billing.get(r["id"], [])} for r in rows]
 
 
-def delete_parent(parent_id: int):
-    with connection() as conn:
+def delete_parent(parent_id: int, *, expected_email: str | None = None):
+    with _PARENT_TRANSPORT_GUARD, connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        _parent(conn, parent_id)
+        item = _parent(conn, parent_id)
+        # INTEGER PRIMARY KEY IDs can be reused after deletion. A stale UI
+        # confirmation must never delete a different mother with the same ID.
+        if expected_email is not None and item["email"] != expected_email:
+            raise TeamAdminError("母号信息已变化，请刷新后重新确认", code="parent_changed", status=409)
         _idle(conn, parent_id)
+        _transport_idle(parent_id)
         conn.execute("DELETE FROM parents WHERE id=?", (parent_id,))
 
 
@@ -385,18 +538,38 @@ def upsert_invites(parent_id: int, workspace_id: str, items: list[dict]):
                          (parent_id, workspace_id, item["id"], item["email"], _dump(item)))
 
 
-def invite_page(parent_id: int, workspace_id: str, *, page: int = 1, page_size: int = 100, query: str = "") -> dict:
+def invite_page(parent_id: int, workspace_id: str, *, page: int = 1, page_size: int | None = 100,
+                query: str = "", seat_type: str = "", status: str = "") -> dict:
+    if seat_type not in {"", "default", "usage_based", "prolite"} or status not in {"", "pending"}:
+        raise TeamAdminError("邀请筛选参数无效")
     with connection() as conn:
         _parent(conn, parent_id)
         args = [parent_id, workspace_id]
         clause = "parent_id=? AND workspace_id=?"
         if query:
-            clause += " AND instr(lower(email),lower(?))>0"
-            args.append(query)
+            clause += " AND (instr(lower(email),lower(?))>0 OR instr(lower(id),lower(?))>0)"
+            args.extend([query, query])
+        if seat_type:
+            clause += " AND json_extract(data,'$.seat_type')=?"
+            args.append(seat_type)
+        if status == "pending":
+            clause += " AND json_extract(data,'$.status')=2"
         total = conn.execute(f"SELECT COUNT(*) FROM invites WHERE {clause}", args).fetchone()[0]
-        rows = conn.execute(f"SELECT data FROM invites WHERE {clause} ORDER BY email,id LIMIT ? OFFSET ?",
-                            (*args, page_size, (page - 1) * page_size))
+        sql = f"SELECT data FROM invites WHERE {clause} ORDER BY email,id"
+        if page_size is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args.extend([page_size, (page - 1) * page_size])
+        rows = conn.execute(sql, args)
         return {"items": [json.loads(r[0]) for r in rows], "total": total, "page": page, "page_size": page_size}
+
+
+def update_invite(parent_id: int, workspace_id: str, item: dict):
+    """Apply an acknowledged seat change only to the matching cached invitation."""
+    with connection() as conn:
+        cursor = conn.execute("UPDATE invites SET data=? WHERE parent_id=? AND workspace_id=? AND id=?",
+                              (_dump(item), parent_id, workspace_id, item["id"]))
+        if cursor.rowcount != 1:
+            raise TeamAdminError("邀请缓存已变化，请手动同步", code="invite_cache_missing", status=409)
 
 
 def mark_invites_stale(workspace_id: str):
@@ -447,7 +620,8 @@ def mark_workspace_stale(workspace_id: str):
 def create_job(parent_id: int, kind: str, workspace_id: str, user_ids: list[str], seat_type: str,
                *, email_addresses: list[str] | None = None, resend_emails: bool = False,
                schedule_preview_id: str = "", removal_plan: dict | None = None,
-               account_plan: dict | None = None) -> dict:
+               account_plan: dict | None = None, invite_ids: list[str] | None = None,
+               concurrency: int = 5) -> dict:
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         _parent(conn, parent_id)
@@ -459,6 +633,9 @@ def create_job(parent_id: int, kind: str, workspace_id: str, user_ids: list[str]
             item["removal_plan"] = removal_plan
         if kind == "switch" and account_plan is not None:
             item["account_plan"] = account_plan
+        if kind == "invite_switch":
+            item.update(invite_ids=list(invite_ids or []), total=len(invite_ids or []),
+                        concurrency=concurrency, running=0, inflight_invites=[])
         if kind == "invite":
             item.update(email_addresses=list(email_addresses or []), resend_emails=resend_emails,
                         total=len(email_addresses or []), flow_id=str(uuid.uuid4()),
@@ -516,7 +693,7 @@ def update_schedule_progress(job_id: str, **changes):
 
 def recent_jobs(parent_id: int) -> list[dict]:
     with connection() as conn:
-        return [{k: v for k, v in json.loads(r[0]).items() if k not in {"user_ids", "results", "email_addresses", "inflight_emails", "schedule_plan", "completion_ids", "removal_plan", "account_plan"}} for r in conn.execute("SELECT data FROM jobs WHERE parent_id=? ORDER BY created_at DESC,rowid DESC LIMIT 10", (parent_id,))]
+        return [{k: v for k, v in json.loads(r[0]).items() if k not in {"user_ids", "invite_ids", "inflight_invites", "results", "email_addresses", "inflight_emails", "schedule_plan", "completion_ids", "removal_plan", "account_plan"}} for r in conn.execute("SELECT data FROM jobs WHERE parent_id=? ORDER BY created_at DESC,rowid DESC LIMIT 10", (parent_id,))]
 
 
 def recover_interrupted():
@@ -529,6 +706,13 @@ def recover_interrupted():
                 # Remote mutations are done. Only observe the already persisted pipelines.
                 continue
             item.update(status="interrupted", message="服务重启中断；席位修改未自动重试，请先同步成员", updated_at=now())
+            if item["kind"] == "invite_switch":
+                results = item.get("results") or []
+                completed = {result.get("invite_id") for result in results}
+                results.extend({**invite, "status": "unconfirmed", "message": "服务中断时仍在处理，远端结果待确认"}
+                               for invite in item.get("inflight_invites", []) if invite.get("invite_id") not in completed)
+                item.update(results=results, completed=len(results), running=0, inflight_invites=[],
+                            message="服务重启中断；邀请切席未自动重试，请先同步待接受邀请")
             if item["kind"] in {"invite", "schedule"}:
                 item["message"] = "服务重启中断；邀请未自动重发，请先同步待接受邀请"
                 results = item.get("results") or []

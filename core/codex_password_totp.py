@@ -168,18 +168,21 @@ def _failure(exc: Exception, *, stage: str, email: str, password: str, secret: s
     if account_unusable:
         retryable = False
         if not isinstance(exc, PasswordTotpLoginError):
-            message = f"账号已废（{code}）"
+            message = f"账号已封禁/停用（{code}）"
     for value in (password, secret):
         if value:
             message = message.replace(value, "***")
     return oauth._codex_result(
         status="deactivated" if account_unusable else "failed", email=email, message=message, failure_stage=stage,
         http_status=status, error_code=code or "password_totp_failed", retryable=retryable,
-        login_mode="password_totp",
+        login_mode="password_totp", error_type=type(exc).__name__,
     )
 
 
 def retry_reason(result: dict) -> str:
+    from core.account_state import unusable_account_code
+    if unusable_account_code(result):
+        return ""
     if result.get("ok") or not result.get("retryable"):
         return ""
     if result.get("error_code") == "oauth_session_invalid":
@@ -193,30 +196,39 @@ def run_once(
     email: str, otp_provider=None, proxy=None, force=False,
     _cpa_reauth_round=1, auth_source=None, expected_workspace_id: str = "",
 ) -> dict:
-    from core import codex_oauth as oauth, db
+    from core import codex_oauth as oauth, db, progress_events
 
     session = None
     password = secret = ""
     verified_factor_id = ""
     stage = "credentials"
     try:
+        progress_events.phase(stage)
         if auth_source != "local":
             raise PasswordTotpLoginError("密码 + 2FA 授权只支持本地 PKCE", code="unsupported_auth_source")
         account = db.get_account_by_email(email) or {}
         password, secret = login_material(account)
-        if str(account.get("codex_status") or "").lower() == "deactivated":
-            raise PasswordTotpLoginError("账号已废号", code="account_deactivated")
+        from core.account_state import unusable_account_code
+        if code := unusable_account_code(account):
+            raise PasswordTotpLoginError("账号已封禁/停用，不再授权", code=code)
         oauth._check_codex_flow_stop(email)
         stage = "session_init"
-        session = oauth.BrowserSession(proxy=proxy, browser_family=oauth._cfg.CODEX_BROWSER_FAMILY)
+        progress_events.phase(stage)
+        session = oauth.BrowserSession(proxy=proxy, browser_family=oauth._codex_browser_profile_key())
+        profile = getattr(session, "browser_profile", {}) or {}
+        logger.info("[Codex][密码+2FA] HTTP 指纹：profile=%s impersonate=%s",
+                    oauth._codex_browser_profile_key(), profile.get("impersonate") or "unknown")
         session._codex_selected_workspace_id = ""
         verifier, challenge = oauth._generate_pkce()
         state = oauth._generate_state()
         stage = "network_preflight"
+        progress_events.phase(stage)
         oauth.network_preflight(session)
         stage = "bootstrap"
+        progress_events.phase(stage)
         oauth._bootstrap_authorize(session, state, challenge)
         stage = "email_submit"
+        progress_events.phase(stage)
         oauth._check_codex_flow_stop(email)
         step = oauth._submit_email_identifier(session, email)
         _reject_additional_verification(step)
@@ -225,6 +237,7 @@ def run_once(
         if page_type not in {"login_password", "password"} and path != "/log-in/password":
             raise PasswordTotpLoginError("服务端未返回密码登录步骤", code="password_step_missing")
         stage = "password"
+        progress_events.phase(stage)
         password_url = _navigate_password(session, step)
         oauth._check_codex_flow_stop(email)
         step = oauth._submit_password_step(session, password)
@@ -232,6 +245,7 @@ def run_once(
         _reject_additional_verification(step)
         if step.get("mfa_required"):
             stage = "mfa"
+            progress_events.phase(stage)
             oauth._check_codex_flow_stop(email)
             target = str(step.get("continue_url") or "")
             stored_factor = str(account.get("totp_factor_id") or "")
@@ -252,6 +266,7 @@ def run_once(
         elif step.get("page_type") not in {"consent", "workspace", "workspace_selection", "external_url"} and not step.get("continue_url"):
             raise PasswordTotpLoginError("密码验证后缺少授权下一步", code="authorization_step_missing")
         stage = "workspace"
+        progress_events.phase(stage)
         oauth._check_codex_flow_stop(email)
         callback = _callback(session, step, state, email, **({"expected_workspace_id": expected_workspace_id} if expected_workspace_id else {}))
         returned_state = parse_qs(urlparse(callback).query).get("state", [""])[0]
@@ -259,6 +274,7 @@ def run_once(
             raise PasswordTotpLoginError("OAuth 回调 state 不匹配或缺失", code="oauth_state_mismatch")
         code = oauth._extract_code(callback, state)
         stage = "token_exchange"
+        progress_events.phase(stage)
         oauth._check_codex_flow_stop(email)
         token = oauth.exchange_codex_token(session, code, verifier)
         if not token.get("access_token") or not token.get("refresh_token"):
@@ -274,6 +290,7 @@ def run_once(
         logger.info("[Codex][密码+2FA] 授权工作区已确认: workspace_id=%s plan=%s",
                     claims["account_id"], claims.get("plan_type") or "unknown")
         stage = "save_credential"
+        progress_events.phase(stage)
         storage = oauth.build_codex_storage(token, claims)
         oauth._check_codex_flow_stop(email)
         path = oauth.save_codex_credential(storage, email, claims.get("plan_type", ""))
@@ -285,7 +302,10 @@ def run_once(
                   "material_fingerprint": login_material_fingerprint(account)}} if verified_factor_id else {}),
         )
     except oauth.AccountUnusableError as exc:
-        return oauth._codex_result(status="deactivated", email=email, message=f"账号已废号（{exc.error_code}）")
+        return oauth._codex_result(status="deactivated", email=email,
+                                   message=f"账号已封禁/停用（{exc.error_code}）",
+                                   error_code=exc.error_code, retryable=False,
+                                   failure_stage=stage, login_mode="password_totp")
     except Exception as exc:
         result = _failure(exc, stage=stage, email=email, password=password, secret=secret)
         logger.warning("[Codex][密码+2FA] %s code=%s", result["message"], result["error_code"])

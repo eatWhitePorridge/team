@@ -15,8 +15,10 @@ logger = logging.getLogger(__name__)
 SAFE_FIELDS = (
     "id", "email", "user_name", "note", "registration_driver", "email_source",
     "plan_type", "current_plan_type", "subscription_plan", "registration_batch_id",
-    "created_at", "updated_at", "codex_last_failure_stage", "codex_status",
+    "created_at", "updated_at", "codex_last_failure_stage", "codex_status", "codex_error_code",
     "quota_status", "quota_checked_at", "quota_ok", "quota_plan_type", "quota_source",
+    "quota_last_success_at", "quota_allowed", "quota_limit_reached",
+    "quota_credits_balance", "quota_credits_has_credits", "quota_credits_unlimited",
     "quota_primary_used_percent", "quota_primary_limit_window_seconds", "quota_primary_reset_at",
     "quota_secondary_used_percent", "quota_secondary_limit_window_seconds", "quota_secondary_reset_at",
     "team_status", "team_workspace_id", "team_seat_type", "team_seat_status",
@@ -24,10 +26,23 @@ SAFE_FIELDS = (
 )
 DERIVED_FIELDS = ("archived", "has_codex_refresh_token", "has_web_cookie", "totp_status", "codex_connection_state")
 ACCOUNT_FIELDS = (*SAFE_FIELDS, *DERIVED_FIELDS)
-# A progress file must not be able to replace identity or credential-presence flags.
-PROGRESS_FIELDS = set(SAFE_FIELDS) - {"id", "email", "created_at", "registration_batch_id"}
+# A progress file cannot replace account identity or credential-presence flags.
+# Batch membership is mutable: the merge service persists it in this journal.
+PROGRESS_FIELDS = set(SAFE_FIELDS) - {"id", "email", "created_at"}
 PROGRESS_FIELDS.add("totp_status")
 BATCH_FIELDS = ("batch_id", "created_at", "updated_at", "email_source", "registration_driver", "count")
+QUOTA_NUMBERS = {"quota_primary_used_percent", "quota_secondary_used_percent", "quota_credits_balance"}
+QUOTA_FLAGS = {"quota_allowed", "quota_limit_reached", "quota_credits_has_credits", "quota_credits_unlimited"}
+
+
+def account_column_type(name):
+    if name == "id":
+        return "INTEGER PRIMARY KEY"
+    if name in QUOTA_NUMBERS:
+        return "REAL"
+    if name in {"archived", "has_codex_refresh_token", "has_web_cookie", "quota_ok"} | QUOTA_FLAGS:
+        return "INTEGER"
+    return "TEXT"
 
 
 def scalar(value):
@@ -36,12 +51,17 @@ def scalar(value):
 
 def safe_projection(row: dict) -> dict:
     out = {key: scalar(row.get(key)) for key in SAFE_FIELDS}
-    for key in ('quota_primary_used_percent', 'quota_secondary_used_percent'):
+    for key in QUOTA_NUMBERS:
         try:
-            number = float(out[key])
-            out[key] = number if math.isfinite(number) else None
-        except (ValueError, TypeError):
+            raw = out[key]
+            number = float(raw) if not isinstance(raw, bool) else float('nan')
+            out[key] = number if math.isfinite(number) and (key == 'quota_credits_balance' or number >= 0) else None
+        except (ValueError, TypeError, OverflowError):
             out[key] = None
+    for key in QUOTA_FLAGS:
+        raw = out[key]
+        # SQLite reads booleans as 0/1; strings like "false" are not booleans.
+        out[key] = bool(raw) if isinstance(raw, (bool, int)) and raw in (0, 1) else None
     try:
         out["id"] = int(row.get("id") or 0)
     except (ValueError, TypeError):
@@ -52,7 +72,12 @@ def safe_projection(row: dict) -> dict:
     out["has_web_cookie"] = bool(row.get("has_web_cookies") or row.get("web_cookie_has_session") or row.get("has_web_cookie"))
     status = str(row.get("totp_status") or "").lower()
     out["totp_status"] = status if status in {"active", "active_external", "queued", "running", "activation_uncertain", "failed", "not_configured"} else ("active" if row.get("totp_secret") else "not_configured")
-    out["codex_connection_state"] = "connected" if out["has_codex_refresh_token"] else (
+    # Keep this projection importable without loading legacy service modules.
+    terminal_code = str(row.get("codex_error_code") or "").strip().lower()
+    if terminal_code not in {"account_deactivated", "account_deleted", "account_banned"}:
+        terminal_code = "account_deactivated" if str(row.get("codex_status") or "").strip().lower() == "deactivated" else ""
+    out["codex_error_code"] = terminal_code or None
+    out["codex_connection_state"] = "deactivated" if terminal_code else "connected" if out["has_codex_refresh_token"] else (
         "running" if str(row.get("codex_status") or "").lower() in {"queued", "running", "retrying"} else "not_connected")
     out["quota_status"] = out["quota_status"] or ("success" if row.get("quota_ok") is True else "unchecked")
     out["registration_driver"] = out["registration_driver"] or "legacy"
@@ -100,8 +125,11 @@ class JsonProjectionSource:
         self.project = safe_batch_projection if batch else safe_projection
         self._signature = object()
         self._base = {}
+        self.pending_transactions = ()
 
     def signature(self):
+        if any(path.exists() for path in self.pending_transactions):
+            raise SourceChanged("membership_transaction_pending")
         target = self.path.resolve(strict=False)
         return (str(target), file_signature(target), file_signature(target.with_name(target.name + ".progress.json")))
 
@@ -150,6 +178,8 @@ class JsonProjectionSource:
             fields = update.get("fields")
             if isinstance(fields, dict):
                 patch = {name: scalar(value) for name, value in fields.items() if name in allowed}
+                if 'registration_batch_id' in patch and not isinstance(patch['registration_batch_id'], str):
+                    patch.pop('registration_batch_id')
                 merged[key] = self.project({**item, **patch})
         if before != self.signature():
             raise SourceChanged("source_changed_during_read")
@@ -180,16 +210,16 @@ class AccountIndex(SQLiteStore):
         self.source_path = Path(source_path)
         self.source = JsonProjectionSource(self.source_path)
         self.loader = loader or self.source
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._signature = object()
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
-            columns = ",".join(f"{name} {'INTEGER PRIMARY KEY' if name == 'id' else 'REAL' if name.endswith('_percent') else 'INTEGER' if name in {'archived', 'has_codex_refresh_token', 'has_web_cookie', 'quota_ok'} else 'TEXT'}" for name in ACCOUNT_FIELDS)
+            columns = ",".join(f"{name} {account_column_type(name)}" for name in ACCOUNT_FIELDS)
             conn.execute(f"CREATE TABLE IF NOT EXISTS accounts ({columns})")
             existing = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
             for name in ACCOUNT_FIELDS:
                 if name not in existing:
-                    conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {'REAL' if name.endswith('_percent') else 'TEXT'}")
+                    conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {account_column_type(name)}")
             for name in ("email", "registration_batch_id", "codex_connection_state", "codex_plan_type", "totp_status", "quota_status"):
                 conn.execute(f"CREATE INDEX IF NOT EXISTS account_{name}_ci ON accounts({name} COLLATE NOCASE)")
             conn.execute("CREATE INDEX IF NOT EXISTS account_batch_plan_ci ON accounts(registration_batch_id COLLATE NOCASE, codex_plan_type COLLATE NOCASE, id DESC) WHERE archived=0")
@@ -210,7 +240,7 @@ class AccountIndex(SQLiteStore):
                 # Compare with SQLite's storage affinities so numeric text fields
                 # do not cause repeated updates after reading the checkpoint.
                 def values(row):
-                    return tuple(None if row.get(key) is None else float(row[key]) if key.endswith('_percent') else str(int(row[key])) if isinstance(row[key], bool) else str(row[key]) for key in ACCOUNT_FIELDS)
+                    return tuple(None if row.get(key) is None else float(row[key]) if key in QUOTA_NUMBERS else str(int(row[key])) if isinstance(row[key], bool) else str(row[key]) for key in ACCOUNT_FIELDS)
                 changed = [row for key, row in incoming.items() if key not in current or values(row) != values(current[key])]
                 removed = set(current) - set(incoming)
                 if changed:
@@ -219,6 +249,18 @@ class AccountIndex(SQLiteStore):
                 conn.executemany("DELETE FROM accounts WHERE id=?", [(key,) for key in removed])
             self._signature = signature
             return {"refreshed": True, "changed": len(changed), "deleted": len(removed), "count": len(incoming)}
+
+    def remove_accounts(self, account_ids):
+        """Evict committed deletions immediately, serialized with refresh.
+
+        The caller holds the source DB lock until this returns. A refresh that
+        already read the old source must finish before the eviction; later
+        refreshes read the new source, so deleted rows cannot reappear.
+        """
+        with self._lock:
+            with self._connect() as conn:
+                conn.executemany('DELETE FROM accounts WHERE id=?', [(value,) for value in account_ids])
+            self._signature = object()
 
     @staticmethod
     def _where(params):
@@ -239,7 +281,7 @@ class AccountIndex(SQLiteStore):
                 args.append(value)
         return ' AND '.join(clauses), args
 
-    def query(self, *, page=1, page_size=50, **params):
+    def query(self, *, page=1, page_size=50, email_scope=None, **params):
         page, page_size = max(1, int(page or 1)), max(1, min(500, int(page_size or 50)))
         where, args = self._where(params)
         sort = params.get("sort_by")
@@ -247,6 +289,14 @@ class AccountIndex(SQLiteStore):
         direction = 'ASC' if params.get("sort_order") == 'asc' else 'DESC'
         with self._connect() as conn:
             conn.execute("BEGIN")
+            if email_scope is not None:
+                # Match the entire cached workspace BEFORE count/pagination.
+                # A connection-local table avoids SQLite variable limits and
+                # cannot leak a previous request's scope. Empty means no rows.
+                conn.execute("CREATE TEMP TABLE account_email_scope (email TEXT PRIMARY KEY COLLATE NOCASE) WITHOUT ROWID")
+                conn.executemany("INSERT OR IGNORE INTO account_email_scope VALUES (?)",
+                                 [(value.strip().casefold(),) for value in email_scope if isinstance(value, str) and value.strip()])
+                where += " AND email COLLATE NOCASE IN (SELECT email FROM temp.account_email_scope)"
             summary = self._summary(conn, where, args)
             total = summary['total']
             page = min(page, max(1, (total + page_size - 1) // page_size))
@@ -293,7 +343,7 @@ class BatchIndex(SQLiteStore):
         self.source = JsonProjectionSource(source_path or account_index.source_path.parent / '注册批次.json', batch=True)
         self.loader = loader or self.source
         self._signature = object()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         with self._connect() as conn:
             conn.execute("PRAGMA secure_delete=ON")
             conn.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -330,15 +380,22 @@ class BatchIndex(SQLiteStore):
                     data = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
                     if data == current.get(key):
                         continue
-                    conn.execute('INSERT INTO batches VALUES(?,?,?,?,?) ON CONFLICT(batch_id) DO UPDATE SET created_at=excluded.created_at,driver=excluded.driver,email_source=excluded.email_source,data=excluded.data', (key, row['created_at'], row['registration_driver'], row['email_source'], data))
-                    conn.execute('DELETE FROM batch_drivers WHERE batch_id=?', (key,))
-                    conn.executemany('INSERT INTO batch_drivers VALUES(?,?)', [(key, driver) for driver in row['registration_drivers']])
+                    self.upsert(conn, row)
                     changed += 1
                 removed = set(current) - set(incoming)
                 conn.executemany('DELETE FROM batches WHERE batch_id=?', [(key,) for key in removed])
                 conn.executemany('DELETE FROM batch_drivers WHERE batch_id=?', [(key,) for key in removed])
             self._signature = signature
             return {'refreshed': True, 'changed': changed, 'deleted': len(removed)}
+
+    @staticmethod
+    def upsert(conn, row):
+        key = row['batch_id']
+        data = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        conn.execute('INSERT INTO batches VALUES(?,?,?,?,?) ON CONFLICT(batch_id) DO UPDATE SET created_at=excluded.created_at,driver=excluded.driver,email_source=excluded.email_source,data=excluded.data',
+                     (key, row['created_at'], row['registration_driver'], row['email_source'], data))
+        conn.execute('DELETE FROM batch_drivers WHERE batch_id=?', (key,))
+        conn.executemany('INSERT INTO batch_drivers VALUES(?,?)', [(key, driver) for driver in row['registration_drivers']])
 
     def query(self, *, page=1, page_size=50, q='', driver=''):
         page, page_size = max(1, int(page or 1)), max(1, min(200, int(page_size or 50)))
@@ -363,6 +420,11 @@ class IndexRefresher:
     """One bounded background writer. Request handlers only read the last snapshot."""
     def __init__(self, accounts, batches, interval=2.0):
         self.accounts, self.batches = accounts, batches
+        target = batches.source.path.resolve(strict=False)
+        # Retain the last complete read model after an interrupted split. Core
+        # recovers the intent on the next business read or explicit startup.
+        pending = (target.with_name(target.name + '.split.json'),)
+        accounts.source.pending_transactions = batches.source.pending_transactions = pending
         self.interval = max(0.1, interval)
         self._wake, self._stop = threading.Event(), threading.Event()
         self._thread = None
@@ -395,6 +457,52 @@ class IndexRefresher:
 
     def request_refresh(self):
         self._wake.set()
+
+    @contextmanager
+    def membership_change(self):
+        # The caller already holds completion + business locks (in that order).
+        # Stop a background projection from observing a multi-file commit midway.
+        with self.accounts._lock, self.batches._lock:
+            yield
+
+    def apply_batch_split(self, result, changed_batches):
+        """Publish exactly the selected membership and updated counts together."""
+        target = next(row for row in changed_batches if row['batch_id'] == result['batch_id'])
+        with self.membership_change():
+            with self.accounts._connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                conn.executemany('UPDATE accounts SET registration_batch_id=?, updated_at=? WHERE id=?',
+                                 [(result['batch_id'], target['updated_at'], key) for key in result['account_ids']])
+                for batch in changed_batches:
+                    self.batches.upsert(conn, batch)
+            self.accounts._signature = self.batches._signature = object()
+
+    def apply_batch_merge(self, result, target_batch):
+        """Publish a committed membership change without rereading credentials.
+
+        Both index locks serialize with in-flight refreshes; the caller holds
+        the business DB lock. Account membership and batch rows commit together.
+        """
+        sources = [(value,) for value in result['merged_batch_ids']]
+        with self.accounts._lock, self.batches._lock:
+            with self.accounts._connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                conn.executemany('UPDATE accounts SET registration_batch_id=?, updated_at=? WHERE registration_batch_id=?',
+                                 [(result['target_batch_id'], target_batch['updated_at'], row[0]) for row in sources])
+                conn.executemany('DELETE FROM batches WHERE batch_id=?', sources)
+                conn.executemany('DELETE FROM batch_drivers WHERE batch_id=?', sources)
+                self.batches.upsert(conn, target_batch)
+            self.accounts._signature = self.batches._signature = object()
+
+    def apply_batch_delete(self, batch_ids, account_ids):
+        """Evict the entire committed cascade in one small SQLite transaction."""
+        with self.accounts._lock, self.batches._lock:
+            with self.accounts._connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                conn.executemany('DELETE FROM accounts WHERE id=?', [(value,) for value in account_ids])
+                conn.executemany('DELETE FROM batches WHERE batch_id=?', [(value,) for value in batch_ids])
+                conn.executemany('DELETE FROM batch_drivers WHERE batch_id=?', [(value,) for value in batch_ids])
+            self.accounts._signature = self.batches._signature = object()
 
     def start(self):
         if self._thread is not None:

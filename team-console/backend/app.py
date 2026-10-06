@@ -8,6 +8,7 @@ from flask import Flask, abort, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 
 from .index_store import AccountIndex, BatchIndex, IndexRefresher
+from .batch_operations import BatchOperationError
 
 logger = logging.getLogger(__name__)
 CONSOLE_ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +63,8 @@ def create_app(*, services=None, index_path=None, start_indexer=False, api_key=N
     app.config.update(MAX_CONTENT_LENGTH=8 * 1024 * 1024,
                       TEAM_CONSOLE_API_KEY=os.getenv('TEAM_CONSOLE_API_KEY', '') if api_key is None else api_key)
     app.extensions['team_console'] = {'accounts': accounts_index, 'batches': batches_index, 'indexer': indexer}
+    from .progress import ProgressFeed, collect_jobs
+    app.extensions['team_console']['progress'] = ProgressFeed(services)
 
     @app.before_request
     def api_key_guard():
@@ -79,6 +82,10 @@ def create_app(*, services=None, index_path=None, start_indexer=False, api_key=N
     @app.errorhandler(ValueError)
     def invalid_request(exc):
         return jsonify(ok=False, error=str(exc)), 400
+
+    @app.errorhandler(BatchOperationError)
+    def batch_conflict(exc):
+        return jsonify(ok=False, error=str(exc), busy=exc.busy), exc.status
 
     @app.errorhandler(Exception)
     def unexpected_error(exc):
@@ -113,8 +120,20 @@ def create_app(*, services=None, index_path=None, start_indexer=False, api_key=N
 
     @app.get('/api/accounts')
     def accounts():
-        params = {key: request.args.get(key, '') for key in ('q', 'batch_id', 'totp_status', 'codex_state', 'codex_plan_type', 'quota_status', 'team_parent_id', 'team_seat_type', 'team_seat_status', 'driver', 'email_source', 'sort_by', 'sort_order')}
-        result = accounts_index.query(page=request.args.get('page', 1, type=int), page_size=request.args.get('page_size', 50, type=int), **params)
+        params = {key: request.args.get(key, '') for key in ('q', 'batch_id', 'totp_status', 'codex_state', 'codex_plan_type', 'quota_status', 'driver', 'email_source', 'sort_by', 'sort_order')}
+        team = {key: request.args.get(key, '').strip() for key in ('team_parent_id', 'team_workspace_id', 'team_seat_type', 'team_seat_status')}
+        email_scope = None
+        if any(team.values()):
+            if not team['team_parent_id'].isdigit() or int(team['team_parent_id']) <= 0 or not team['team_workspace_id']:
+                raise ValueError('查看子号需要指定母号和工作区')
+            try:
+                # Cached membership, not stale account tags or a guessed batch.
+                # No remote sync, credentials lookup or large JSON read here.
+                email_scope = services.team_store.child_account_emails(
+                    team['team_parent_id'], team['team_workspace_id'], team['team_seat_type'], team['team_seat_status'])
+            except services.team_store.TeamAdminError as exc:
+                return jsonify(ok=False, error=str(exc), code=exc.code), exc.status
+        result = accounts_index.query(page=request.args.get('page', 1, type=int), page_size=request.args.get('page_size', 50, type=int), email_scope=email_scope, **params)
         return jsonify(**result, index=indexer.status())
 
     @app.get('/api/accounts/<int:account_id>')
@@ -142,10 +161,13 @@ def create_app(*, services=None, index_path=None, start_indexer=False, api_key=N
 
     @app.post('/api/accounts/authorize')
     def authorize():
+        from .authorization_target import authorization_workspace
         data = _json_body()
         ids = _ids(data)
         team = _boolean(data, 'team_authorization')
-        result = _queue_result(services.completion.enqueue_accounts(ids, login_mode='password_totp', team_authorization=team))
+        workspace = authorization_workspace(data, team=team, store=services.team_store)
+        result = _queue_result(services.completion.enqueue_accounts(ids, login_mode='password_totp', team_authorization=team,
+            **({'expected_workspace_id': workspace} if workspace else {})))
         indexer.request_refresh()
         return jsonify(result), 202 if result['ok'] else 409
 
@@ -154,6 +176,32 @@ def create_app(*, services=None, index_path=None, start_indexer=False, api_key=N
         result = _queue_result(services.quota.enqueue_accounts_quota_check(_ids(_json_body())))
         indexer.request_refresh()
         return jsonify(result), 202 if result['ok'] else 409
+
+    @app.post('/api/accounts/delete')
+    def delete_accounts():
+        from .account_deletion import delete_accounts as delete_local_accounts
+        data = _json_body()
+        ids = _ids(data, max_count=5000)
+        if not _boolean(data, 'confirm'):
+            raise ValueError('请先确认删除账号；此操作不可撤销')
+        try:
+            result = delete_local_accounts(db, services.completion, ids, index=accounts_index)
+        finally:
+            indexer.request_refresh()
+        return jsonify(result), 200 if result['ok'] else 409
+
+    @app.post('/api/accounts/split-batch')
+    def split_accounts():
+        from .batch_operations import split_accounts as split_local_accounts
+        data = _json_body()
+        ids = _ids(data, max_count=5000)
+        if not _boolean(data, 'confirm'):
+            raise ValueError('请先确认将选中账号拆分到新批次')
+        try:
+            return jsonify(split_local_accounts(db, services.completion, ids,
+                           data.get('request_id'), indexer=indexer))
+        finally:
+            indexer.request_refresh()
 
     @app.post('/api/accounts/export-totp')
     def export_totp():
@@ -179,14 +227,46 @@ def create_app(*, services=None, index_path=None, start_indexer=False, api_key=N
         result = batches_index.query(page=request.args.get('page', 1, type=int), page_size=request.args.get('page_size', 50, type=int), q=request.args.get('q', ''), driver='imported')
         return jsonify(**result, index=indexer.status())
 
+    @app.post('/api/batches/merge')
+    def merge_batches():
+        from .batch_operations import batch_ids, merge_batches as merge_local_batches
+        data = _json_body()
+        ids = batch_ids(data, minimum=2)
+        if not _boolean(data, 'confirm'):
+            raise ValueError('请先确认合并批次')
+        try:
+            return jsonify(merge_local_batches(db, services.completion, ids, data.get('target_batch_id'), indexer=indexer))
+        finally:
+            indexer.request_refresh()
+
+    @app.post('/api/batches/delete')
+    def delete_batches():
+        from .batch_operations import batch_ids, delete_batches as delete_local_batches
+        data = _json_body()
+        ids = batch_ids(data)
+        if not _boolean(data, 'confirm') or not _boolean(data, 'cascade_accounts'):
+            raise ValueError('请先确认级联删除批次及其全部账号；此操作不可撤销')
+        try:
+            return jsonify(delete_local_batches(db, services.completion, ids, indexer=indexer))
+        finally:
+            indexer.request_refresh()
+
     @app.get('/api/jobs')
     def jobs():
-        team_jobs = []
-        for parent in services.team_store.list_parents():
-            for item in services.team_store.recent_jobs(parent['id']):
-                team_jobs.append({**item, 'parent_email': parent.get('email')})
-        team_jobs.sort(key=lambda row: (row.get('status') in {'queued', 'running'}, row.get('created_at') or ''), reverse=True)
-        return jsonify(team=team_jobs[:100], authorization=services.completion.list_authorization_batches(limit=4), pipeline=services.completion.list_items(limit=100), runtime=services.authorization.executor_status())
+        feed = app.extensions['team_console']['progress']
+        _, snapshot, failed = feed.current()
+        return jsonify(snapshot if snapshot is not None and not failed else collect_jobs(services))
+
+    @app.get('/api/jobs/authorization/<batch_id>')
+    def authorization_task_detail(batch_id):
+        import re
+        from .progress import authorization_detail
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,200}', batch_id):
+            raise ValueError('授权任务 ID 无效')
+        result = authorization_detail(services, batch_id, app.extensions['team_console']['progress'].phases())
+        if result is None:
+            return jsonify(ok=False, error='授权任务不存在或历史记录已清理'), 404
+        return jsonify(result)
 
     @app.get('/api/team/parents/<int:parent_id>/workspaces/<workspace_id>/members')
     @app.post('/api/team/parents/<int:parent_id>/workspaces/<workspace_id>/members/search')

@@ -13,4 +13,5 @@ if host not in {'127.0.0.1', 'localhost', '::1'} and not os.getenv('TEAM_CONSOLE
 app = create_app(start_indexer=True)
 
 if __name__ == '__main__':
-    app.run(host=host, port=int(os.getenv('TEAM_CONSOLE_PORT', '5050')), threaded=True)
+    from container_server import run
+    run(app)

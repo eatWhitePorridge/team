@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from core import db
+from core import progress_events
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class _TrackedExecutor(ThreadPoolExecutor):
         state = ["queued"]
         with self._metrics_lock:
             self._queued_count += 1
+        progress_events.notify('runtime')
 
         def run():
             with self._metrics_lock:
@@ -54,18 +56,21 @@ class _TrackedExecutor(ThreadPoolExecutor):
                 self._queued_count -= 1
                 self._running_count += 1
                 self._peak_running = max(self._peak_running, self._running_count)
+            progress_events.notify('runtime')
             try:
                 return fn(*args, **kwargs)
             finally:
                 with self._metrics_lock:
                     self._running_count -= 1
                     state[0] = "finished"
+                progress_events.notify('runtime')
 
         def discard_queued():
             with self._metrics_lock:
                 if state[0] == "queued":
                     self._queued_count -= 1
                     state[0] = "discarded"
+            progress_events.notify('runtime')
 
         try:
             future = super().submit(run)
@@ -398,7 +403,8 @@ def run_worker(
         check_stop_requested(email)
         options = dict(sms_options or {})
         options.setdefault("job_id", f"retry:{email}")
-        with sms_provider.runtime_context(options):
+        with sms_provider.runtime_context(options), progress_events.job_context(options.get('job_id')):
+            progress_events.phase('starting')
             result = run_codex_oauth(
                 email,
                 force=True,
@@ -407,6 +413,7 @@ def run_worker(
                 **({"login_mode": login_mode} if login_mode != "email_otp" else {}),
                 **({"auto_retry": False} if not oauth_auto_retry else {}),
             )
+            progress_events.phase('persisting')
         check_stop_requested(email)
         logger.info(
             "[Codex 补跑] 结果：status=%s ok=%s file=%s callback=%s",

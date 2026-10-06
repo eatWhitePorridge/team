@@ -32,12 +32,16 @@ COPY webui/__init__.py webui/team_admin_routes.py ./webui/
 COPY team-console/ ./team-console/
 COPY --from=frontend /build/dist/ ./team-console/frontend/dist/
 RUN test -s team-console/frontend/dist/index.html \
+    && find team-console/frontend/dist -type d -exec chmod 755 {} + \
+    && find team-console/frontend/dist -type f -exec chmod 644 {} + \
     && test -s sentinel/sentinel-runner.js \
     && node --version
 
 WORKDIR /app/team-console
 USER 10001:10001
+# Validate as the actual service user, not root. Never relax /data or env modes.
+RUN python static_assets.py
 EXPOSE 5050
-HEALTHCHECK --interval=30s --timeout=8s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=12s --start-period=30s --retries=3 \
     CMD ["python", "docker_healthcheck.py"]
 CMD ["python", "container_server.py"]

@@ -14,11 +14,13 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from core import db, registration_service, team_invite_service, totp_service
+from core import progress_events
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,14 @@ _TEAM_AUTH_MAX_RETRIES = 6
 _TEAM_AUTH_MAX_ATTEMPTS = 1 + _TEAM_AUTH_MAX_RETRIES
 _TEAM_AUTH_RETRY_DELAY = 2.0
 _STATE_CACHE: tuple[tuple[Any, ...], list[dict[str, Any]], dict[str, dict[str, Any]]] | None = None
+_BULK_AUTHORIZATION = False
+_ITEM_UPDATES = threading.local()
+
+
+def configure_authorization_dispatch() -> None:
+    """Opt in only for the isolated console; legacy registration is unchanged."""
+    global _BULK_AUTHORIZATION
+    _BULK_AUTHORIZATION = True
 
 
 def _now_iso() -> str:
@@ -81,6 +91,7 @@ def _write_rows(rows: list[dict[str, Any]]) -> None:
         stat = _STATE_PATH.stat()
         signature = (str(_STATE_PATH), stat.st_mtime_ns, stat.st_size, stat.st_ino)
         _STATE_CACHE = (signature, rows, {str(row.get("id")): row for row in rows})
+        progress_events.notify('pipeline')
     except BaseException:
         # Callers mutate cached rows before saving; failed writes must be
         # followed by a disk read, not an apparent in-memory success.
@@ -100,12 +111,20 @@ def _public_item(row: dict[str, Any]) -> dict[str, Any]:
             "id", "batch_id", "batch_total", "account_id", "email", "status", "stage", "message",
             "error", "created_at", "updated_at", "completed_at", "expected_workspace_id", "source_job_id", "login_mode",
             "codex_plan_type",
-            "team_authorization", "codex_attempt_count", "codex_max_attempts",
+            "team_authorization", "codex_attempt_count", "codex_max_attempts", "codex_job_id",
         )
     }
 
 
 def _set_item(item_id: str, **changes: Any) -> dict[str, Any] | None:
+    buffered = getattr(_ITEM_UPDATES, "value", None)
+    if buffered is not None:
+        originals, updates = buffered
+        row = originals.get(str(item_id))
+        if row is None:
+            raise RuntimeError("批量进度更新包含未知任务")
+        updates.setdefault(str(item_id), {}).update(changes, updated_at=_now_iso())
+        return {**row, **updates[str(item_id)]}
     with _LOCK:
         rows = _read_rows()
         row = _STATE_CACHE[2].get(str(item_id)) if _STATE_CACHE else None
@@ -119,6 +138,46 @@ def _set_item(item_id: str, **changes: Any) -> dict[str, Any] | None:
         row["updated_at"] = _now_iso()
         _write_rows(rows)
         return dict(row)
+
+
+@contextmanager
+def _batch_item_updates(items):
+    """Stage transitions privately, then publish one durable, guarded snapshot.
+
+    No coordinator lock is held during DB reads or queue admission. Concurrent
+    cancellation/other transitions win; failed writes never publish fake progress.
+    """
+    if getattr(_ITEM_UPDATES, "value", None) is not None:
+        raise RuntimeError("不能嵌套批量进度更新")
+    originals = {str(item["id"]): dict(item) for item in items}
+    updates = {}
+    _ITEM_UPDATES.value = (originals, updates)
+    try:
+        yield
+    except BaseException:
+        raise
+    else:
+        if updates:
+            with _LOCK:
+                rows = _read_rows()
+                replacements = {}
+                for row in rows:
+                    ident = str(row.get("id"))
+                    if (ident in updates and row.get("status") in _ACTIVE_STATUSES
+                            and _item_signature(row) == _item_signature(originals[ident])):
+                        replacements[ident] = {**row, **updates[ident]}
+                if replacements:
+                    _write_rows([replacements.get(str(row.get("id")), row) for row in rows])
+                    finished = sum(row.get("status") in _TERMINAL for row in replacements.values())
+                    if finished:
+                        logger.info("[授权] 已确认并保存账号结果: completed=%s", finished)
+    finally:
+        del _ITEM_UPDATES.value
+
+
+def _has_codex_credential(account, snapshot=None):
+    return (bool(account.get("has_codex_refresh_token")) if snapshot is not None
+            else bool(str(account.get("codex_refresh_token") or "").strip()))
 
 
 def _get_item(item_id: str) -> dict[str, Any] | None:
@@ -146,7 +205,8 @@ def _item_signature(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _finish(item: dict[str, Any], *, ok: bool, message: str, error: str = "", codex_plan_type: str | None = None) -> None:
+def _finish(item: dict[str, Any], *, ok: bool, message: str, error: str = "", codex_plan_type: str | None = None,
+            codex_attempt_count: int | None = None) -> None:
     status = "success" if ok else "failed"
     _set_item(
         str(item["id"]),
@@ -157,7 +217,10 @@ def _finish(item: dict[str, Any], *, ok: bool, message: str, error: str = "", co
         completed_at=_now_iso(),
         **({"invite_url": None} if item.get("login_mode") == "password_totp" else {}),
         **({"codex_plan_type": codex_plan_type} if codex_plan_type is not None else {}),
+        **({"codex_attempt_count": codex_attempt_count} if codex_attempt_count is not None else {}),
     )
+    if getattr(_ITEM_UPDATES, "value", None) is not None:
+        return  # The batch logs completion only after its durable commit.
     logger.info(
         "[一键补全] 账号流水线%s: account_id=%s stage=%s message=%s",
         "完成" if ok else "停止",
@@ -179,6 +242,16 @@ def _move(item: dict[str, Any], stage: str, message: str, **extra: Any) -> None:
     )
 
 
+def _stop_for_account_ban(item: dict[str, Any], *records: dict | None) -> bool:
+    from core.account_state import unusable_account_code
+    code = next((code for row in records if (code := unusable_account_code(row))), "")
+    if not code:
+        return False
+    _finish(item, ok=False, message=f"账号已封禁/停用（{code}），已停止重试",
+            error=code)
+    return True
+
+
 def _retry_team_authorization(item: dict[str, Any], error: str, *, plan: str = "") -> None:
     attempt = int(item.get("codex_attempt_count") or 0)
     if attempt >= _TEAM_AUTH_MAX_ATTEMPTS:
@@ -193,7 +266,7 @@ def _retry_team_authorization(item: dict[str, Any], error: str, *, plan: str = "
                 item.get("account_id"), attempt, _TEAM_AUTH_MAX_ATTEMPTS, plan or "unknown", error[:200])
 
 
-def _advance(item: dict[str, Any]) -> None:
+def _advance(item: dict[str, Any], *, snapshot=None) -> None:
     expected_workspace_id = str(item.get("expected_workspace_id") or "")
     password_totp = item.get("login_mode") == "password_totp"
     team_authorization = password_totp and bool(item.get("team_authorization"))
@@ -210,7 +283,7 @@ def _advance(item: dict[str, Any]) -> None:
         if latest is None or latest.get("status") not in _ACTIVE_STATUSES:
             return
     account_id = int(item.get("account_id") or 0)
-    account = db.get_account(account_id)
+    account = snapshot["accounts"].get(account_id) if snapshot is not None else db.get_account(account_id)
     if not account:
         _finish(item, ok=False, message="账号不存在")
         return
@@ -221,7 +294,9 @@ def _advance(item: dict[str, Any]) -> None:
     if (expected_workspace_id or password_totp) and email.casefold() != str(item.get("email") or "").casefold():
         _finish(item, ok=False, message="调度账号邮箱已变化，后续步骤不执行")
         return
-    codex_matches = bool(str(account.get("codex_refresh_token") or "").strip()) and (
+    if _stop_for_account_ban(item, account):
+        return
+    codex_matches = _has_codex_credential(account, snapshot) and (
         not expected_workspace_id or account.get("codex_workspace_id") == expected_workspace_id
     )
 
@@ -336,6 +411,8 @@ def _advance(item: dict[str, Any]) -> None:
             )
             return
         account = db.get_account(account_id) or account
+        if _stop_for_account_ban(item, account):
+            return
         if not password_totp and str(account.get("codex_refresh_token") or "").strip() and (
             not expected_workspace_id or account.get("codex_workspace_id") == expected_workspace_id
         ):
@@ -353,10 +430,21 @@ def _advance(item: dict[str, Any]) -> None:
 
     if stage == "codex_waiting":
         job_id = int(item.get("codex_job_id") or 0)
-        job = db.get_job(job_id) if job_id else None
+        job = snapshot["jobs"].get(job_id) if snapshot is not None else db.get_job(job_id) if job_id else None
         if job and str(job.get("status") or "") in _JOB_ACTIVE:
             return
-        account = db.get_account(account_id) or account
+        if snapshot is None:
+            account = db.get_account(account_id) or account
+        if _stop_for_account_ban(item, account, job):
+            return
+        if job and job.get("status") == "failed" and job.get("codex_preflight_exhausted"):
+            # Preflight already used its independent bound. Do not multiply it
+            # by the seven Team attempts or count this unstarted reservation.
+            _finish(item, ok=False, message="代理预检失败，未开始本次授权，不占授权重试次数",
+                    error=str(job.get("error_message") or "代理预检次数已耗尽"),
+                    codex_attempt_count=(max(0, int(item.get("codex_attempt_count") or 0) - 1)
+                                         if team_authorization else None))
+            return
         if team_authorization:
             from core.codex_plan import TEAM_PLANS, normalize_plan
             if job and job.get("status") in {"stopped", "cancelled"}:
@@ -372,7 +460,7 @@ def _advance(item: dict[str, Any]) -> None:
                 and int(job.get("account_id") or 0) == account_id
                 and str(summary.get("email") or "").casefold() == email.casefold()
                 and workspace and account.get("codex_workspace_id") == workspace
-                and str(account.get("codex_refresh_token") or "").strip()
+                and _has_codex_credential(account, snapshot)
                 and (not expected_workspace_id or workspace == expected_workspace_id)
             )
             if confirmed and plan in TEAM_PLANS:
@@ -384,7 +472,7 @@ def _advance(item: dict[str, Any]) -> None:
                 _retry_team_authorization(item, error, plan=plan)
             return
         if (job and (not password_totp or (job.get("flow_snapshot") or {}).get("codex_login_mode") == "password_totp")
-                and str(job.get("status") or "") == "success" and str(account.get("codex_refresh_token") or "").strip()
+                and str(job.get("status") or "") == "success" and _has_codex_credential(account, snapshot)
                 and (not password_totp or bool(account.get("codex_workspace_id")))
                 and (not expected_workspace_id or account.get("codex_workspace_id") == expected_workspace_id)):
             if password_totp:
@@ -528,6 +616,14 @@ def _scheduler_tick() -> int:
         active = [dict(row) for row in _read_rows() if str(row.get("status")) in _ACTIVE_STATUSES]
     if not active:
         return 0
+    active_count = len(active)
+    if _BULK_AUTHORIZATION:
+        import sys
+        from core import authorization_dispatch
+        authorization_dispatch.tick(sys.modules[__name__])
+        active = [item for item in active if not authorization_dispatch.eligible(item)]
+        if not active:
+            return active_count
     snapshot = db.account_completion_snapshot(
         [int(item.get("account_id") or 0) for item in active],
         [int(item["codex_job_id"]) for item in active if item.get("codex_job_id")],
@@ -542,11 +638,14 @@ def _scheduler_tick() -> int:
         except Exception as exc:
             logger.exception("[一键补全] 编排异常: account_id=%s", item.get("account_id"))
             _finish(item, ok=False, message="一键补全编排异常", error=f"{type(exc).__name__}: {str(exc)[:300]}")
-    return len(active)
+    return active_count
 
 
 def _scheduler() -> None:
     while True:
+        # A job completed during this tick must interrupt the next wait. Clearing
+        # after wait used to discard notifications received while dispatching.
+        _WAKE.clear()
         try:
             active_count = _scheduler_tick()
             from core import team_schedule_service
@@ -555,7 +654,6 @@ def _scheduler() -> None:
             logger.exception("[一键补全] 本轮状态读取失败，稍后重试")
             active_count = 1
         _WAKE.wait(_POLL_SECONDS if active_count else 5.0)
-        _WAKE.clear()
 
 
 def _ensure_scheduler() -> None:
@@ -698,43 +796,80 @@ def list_items(*, limit: int = 500, batch_id: str = "") -> list[dict[str, Any]]:
     return [_public_item(row) for row in rows[-max(1, min(5000, int(limit))):][::-1]]
 
 
-def list_authorization_batches(*, limit: int = 4) -> list[dict[str, Any]]:
-    """Discover persisted authorization batches without returning credentials or emails.
-
-    Retain every active batch and a few recent finished batches of each mode.
-    Group before limiting so an older running task cannot be hidden by history.
-    """
-    groups: dict[str, dict[str, Any]] = {}
+def progress_snapshot(*, batch_limit: int = 4) -> dict:
+    """One consistent, credential-free view; never hide older active work."""
     with _LOCK:
-        for row in _read_rows():
-            if row.get("login_mode") != "password_totp" or not row.get("batch_id"):
-                continue
-            batch_id = str(row["batch_id"])
-            batch = groups.setdefault(batch_id, {
-                "batch_id": batch_id,
-                "team_authorization": bool(row.get("team_authorization")),
-                "created_at": str(row.get("created_at") or ""),
-                "total": 0, "known": 0, "active": 0, "finished": 0,
-            })
-            batch["known"] += 1
-            batch["active"] += row.get("status") in _ACTIVE_STATUSES
-            batch["finished"] += row.get("status") in _TERMINAL
-            batch["total"] = max(batch["total"], int(row.get("batch_total") or 0), batch["known"])
-            batch["created_at"] = min(batch["created_at"], str(row.get("created_at") or ""))
+        rows = _read_rows()
+        if not rows and _STATE_CACHE is None and _STATE_PATH.exists():
+            raise RuntimeError('任务进度文件读取失败')
+        history = [row for row in rows if row.get('status') not in _ACTIVE_STATUSES][-100:]
+        active = [row for row in rows if row.get('status') in _ACTIVE_STATUSES]
+        return {'pipeline': [_public_item(row) for row in [*active[::-1], *history[::-1]]],
+                'authorization': list_authorization_batches(limit=batch_limit)}
+
+
+def _authorization_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate the complete retained task, not the 100-row live detail window."""
+    groups: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.get("login_mode") != "password_totp" or not row.get("batch_id"):
+            continue
+        batch_id = str(row["batch_id"])
+        batch = groups.setdefault(batch_id, {
+            "batch_id": batch_id,
+            "team_authorization": bool(row.get("team_authorization")),
+            "expected_workspace_id": str(row.get("expected_workspace_id") or ""),
+            "created_at": str(row.get("created_at") or ""), "updated_at": "",
+            "total": 0, "known": 0, "active": 0, "finished": 0,
+            "success": 0, "failed": 0, "cancelled": 0,
+        })
+        batch["known"] += 1
+        batch["active"] += row.get("status") in _ACTIVE_STATUSES
+        batch["finished"] += row.get("status") in _TERMINAL
+        for status in ("success", "failed", "cancelled"):
+            batch[status] += row.get("status") == status
+        batch["total"] = max(batch["total"], int(row.get("batch_total") or 0), batch["known"])
+        batch["created_at"] = min(batch["created_at"], str(row.get("created_at") or ""))
+        batch["updated_at"] = max(batch["updated_at"], str(row.get("updated_at") or row.get("created_at") or ""))
+        if batch["expected_workspace_id"] != str(row.get("expected_workspace_id") or ""):
+            batch["expected_workspace_id"] = ""
+    for batch in groups.values():
+        batch["completed"] = batch["finished"] == batch["total"]
+        batch["missing"] = max(0, batch["total"] - batch["known"])
+        for field in ("created_at", "updated_at"):
+            if batch[field]:
+                batch[field] = datetime.fromisoformat(batch[field]).astimezone().isoformat()
+    return sorted(groups.values(), key=lambda item: (item["created_at"], item["batch_id"]), reverse=True)
+
+
+def list_authorization_batches(*, limit: int = 4) -> list[dict[str, Any]]:
+    """All active tasks plus recent finished tasks of each mode; no credentials."""
+    with _LOCK:
+        groups = _authorization_summaries(_read_rows())
     kept = []
     counts = {False: 0, True: 0}
     history_limit = max(1, min(20, int(limit)))
-    for batch in sorted(groups.values(), key=lambda item: (item["created_at"], item["batch_id"]), reverse=True):
+    for batch in groups:
         mode = batch["team_authorization"]
         if not batch["active"]:
             if counts[mode] >= history_limit:
                 continue
             counts[mode] += 1
-        batch["completed"] = batch["finished"] == batch["total"]
-        if batch["created_at"]:
-            batch["created_at"] = datetime.fromisoformat(batch["created_at"]).astimezone().isoformat()
         kept.append(batch)
     return kept
+
+
+def authorization_batch_detail(batch_id: str) -> dict | None:
+    """Read every retained account in one submission; never enqueue or read credentials."""
+    with _LOCK:
+        rows = _read_rows()
+        if not rows and _STATE_CACHE is None and _STATE_PATH.exists():
+            raise RuntimeError('任务进度文件读取失败')
+        items = [row for row in rows if row.get('batch_id') == batch_id and row.get('login_mode') == 'password_totp']
+        if not items:
+            return None
+        return {'batch': _authorization_summaries(items)[0],
+                'items': [_public_item(row) for row in items], 'total': len(items)}
 
 
 def items_by_source(source_job_id: str) -> list[dict]:

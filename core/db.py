@@ -61,6 +61,7 @@ _LOCK = threading.RLock()
 _JSON_CACHE_LOCK = threading.RLock()
 _JSON_CACHE: dict[str, tuple[tuple[int, int, int], Any]] = {}
 _BATCH_MERGE_RECOVERING = False
+_BATCH_SPLIT_RECOVERING = False
 _ACCOUNT_IMPORT_RECOVERING = False
 _CODEX_METADATA_LOCK = threading.RLock()
 _CODEX_METADATA_CACHE: dict[str, tuple[tuple[int, int, int], dict | None]] = {}
@@ -116,6 +117,7 @@ _ACCOUNT_PROGRESS_SAFE_FIELDS = frozenset({
     "quota_secondary_limit_window_seconds", "quota_secondary_reset_after_seconds",
     "quota_secondary_reset_at", "quota_reset_credits_available_count",
     "quota_reset_credit_expirations", "quota_additional_rate_limits",
+    "quota_credits_balance", "quota_credits_has_credits", "quota_credits_unlimited",
     "quota_network_route", "quota_proxy_mode", "quota_proxy_used",
     "quota_proxy_fallback_reason", "quota_attempt_count", "quota_max_attempts",
     "quota_request_timeout", "quota_check_id", "quota_last_success_at",
@@ -1343,6 +1345,7 @@ def _save_account_progress_many(rows: list[dict], changes: list[tuple[dict, dict
 def _load_accounts() -> list[dict]:
     _recover_password_totp_import()
     _recover_registration_batch_merge()
+    _recover_registration_batch_split()
     rows = _read_json(_ACCOUNTS_JSON, None)
     if not isinstance(rows, list):
         rows = _read_json(_LEGACY_ACCOUNTS_JSON, [])
@@ -1661,6 +1664,7 @@ def mask_job_secrets(value: Any) -> Any:
 def _load_batches() -> list[dict]:
     _recover_password_totp_import()
     _recover_registration_batch_merge()
+    _recover_registration_batch_split()
     rows = _read_json(_BATCHES_JSON, [])
     if not isinstance(rows, list):
         return []
@@ -1926,6 +1930,9 @@ def _decorate_account(row: dict) -> dict:
         "quota_reset_credits_available_count": None,
         "quota_reset_credit_expirations": [],
         "quota_additional_rate_limits": [],
+        "quota_credits_balance": None,
+        "quota_credits_has_credits": None,
+        "quota_credits_unlimited": None,
         "quota_network_route": None,
         "quota_proxy_mode": None,
         "quota_proxy_used": None,
@@ -2490,6 +2497,7 @@ def _recover_password_totp_import() -> None:
 def password_totp_account_errors(account_ids: list[int]) -> dict[int, str]:
     """Batch admission reads credentials once and only returns validation errors."""
     from core.codex_password_totp import login_material, PasswordTotpLoginError
+    from core.account_state import unusable_account_code
 
     wanted = set(account_ids)
     errors = {}
@@ -2500,8 +2508,8 @@ def password_totp_account_errors(account_ids: list[int]) -> dict[int, str]:
                 continue
             try:
                 login_material(row)
-                if str(row.get("codex_status") or "").lower() == "deactivated":
-                    errors[account_id] = "账号已废号"
+                if unusable_account_code(row):
+                    errors[account_id] = "账号已封禁/停用，不再授权"
             except PasswordTotpLoginError as exc:
                 errors[account_id] = str(exc)
     return errors
@@ -2806,6 +2814,8 @@ def update_account_codex_statuses_bulk(updates: list[dict]) -> None:
 def update_account_codex_result(email: str, result: dict | None) -> bool:
     """同步 Codex 结果；Web access_token 永远不会在此函数中写入。"""
     result = result or {}
+    from core.account_state import unusable_account_code
+    terminal_code = unusable_account_code(result)
     credential = result.get("credential") if isinstance(result.get("credential"), dict) else {}
     path_text = str(result.get("file_path") or "").strip()
     if path_text and not credential:
@@ -2819,6 +2829,8 @@ def update_account_codex_result(email: str, result: dict | None) -> bool:
     status = (
         "success" if refresh_token else "failed"
     ) if requested_ok else str(result.get("status") or "failed")
+    if terminal_code:
+        status, refresh_token = "deactivated", ""
     error = None if status == "success" else str(
         result.get("message") or ("Codex OAuth 未返回 refresh_token" if requested_ok else "Codex OAuth 未完成")
     )[:1000]
@@ -2830,6 +2842,7 @@ def update_account_codex_result(email: str, result: dict | None) -> bool:
         previous = dict(row)
         now = _now()
         row["codex_status"] = status
+        row["codex_error_code"] = terminal_code or None
         row["codex_error"] = error
         row["codex_last_attempt_status"] = status
         row["codex_last_attempt_at"] = now
@@ -3815,6 +3828,7 @@ def update_account_quota_check(acc_id: int, *, result: dict | None = None, check
                 "quota_secondary_used_percent", "quota_secondary_limit_window_seconds",
                 "quota_secondary_reset_after_seconds", "quota_secondary_reset_at",
                 "quota_reset_credits_available_count", "quota_reset_credit_expirations",
+                "quota_credits_balance", "quota_credits_has_credits", "quota_credits_unlimited",
                 "quota_additional_rate_limits", "quota_network_route", "quota_proxy_mode",
                 "quota_proxy_used", "quota_proxy_fallback_reason", "quota_attempt_count",
                 "quota_max_attempts", "quota_request_timeout",
@@ -3838,6 +3852,7 @@ def update_account_quota_check(acc_id: int, *, result: dict | None = None, check
             "quota_secondary_limit_window_seconds", "quota_secondary_reset_after_seconds",
             "quota_secondary_reset_at", "quota_reset_credits_available_count",
             "quota_reset_credit_expirations", "quota_additional_rate_limits",
+            "quota_credits_balance", "quota_credits_has_credits", "quota_credits_unlimited",
             "quota_network_route", "quota_proxy_mode", "quota_proxy_used",
             "quota_proxy_fallback_reason", "quota_attempt_count", "quota_max_attempts",
             "quota_request_timeout", "updated_at",
@@ -6203,7 +6218,7 @@ def account_completion_snapshot(
     wanted_jobs = set(job_ids or ())
     account_fields = (
         "id", "email", "team_status", "team_invite_status", "team_invite_attempt_count",
-        "totp_status", "totp_attempt_count",
+        "totp_status", "totp_attempt_count", "codex_status", "codex_error_code",
     )
     with _LOCK:
         accounts = {
@@ -6213,6 +6228,34 @@ def account_completion_snapshot(
         }
         jobs = {
             int(row["id"]): {"id": row["id"], "status": row.get("status")}
+            for row in (_load_jobs() if wanted_jobs else [])
+            if int(row.get("id") or 0) in wanted_jobs
+        }
+    return {"accounts": accounts, "jobs": jobs}
+
+
+def authorization_dispatch_snapshot(account_ids: list[int], job_ids: list[int]) -> dict:
+    """Read one consistent authorization view, without copying credentials.
+
+    The coordinator validates results using the same fields as its single-item
+    path, but must not rescan both large tables once per completed account.
+    """
+    wanted_accounts, wanted_jobs = set(account_ids), set(job_ids)
+    fields = ("id", "email", "codex_workspace_id", "codex_plan_type", "codex_credential_path", "codex_error",
+              "codex_status", "codex_error_code")
+    with _LOCK:
+        accounts = {
+            int(row["id"]): {**{key: row.get(key) for key in fields},
+                             "has_codex_refresh_token": bool(str(row.get("codex_refresh_token") or "").strip())}
+            for row in (_load_accounts() if wanted_accounts else [])
+            if int(row.get("id") or 0) in wanted_accounts
+        }
+        jobs = {
+            int(row["id"]): {
+                **{key: row.get(key) for key in ("id", "account_id", "status", "error_message", "codex_error_code", "codex_preflight_exhausted")},
+                "flow_snapshot": {"codex_login_mode": (row.get("flow_snapshot") or {}).get("codex_login_mode")},
+                "codex_authorization": dict(row.get("codex_authorization") or {}),
+            }
             for row in (_load_jobs() if wanted_jobs else [])
             if int(row.get("id") or 0) in wanted_jobs
         }
@@ -6325,6 +6368,7 @@ def get_account_quota_summaries_by_emails(emails: list[str]) -> dict[str, dict |
         "quota_secondary_used_percent", "quota_secondary_limit_window_seconds",
         "quota_secondary_reset_at", "quota_reset_credits_available_count",
         "quota_reset_credit_expirations", "quota_additional_rate_limits",
+        "quota_credits_balance", "quota_credits_has_credits", "quota_credits_unlimited",
     )
     result = {}
     with _LOCK:
@@ -10442,6 +10486,160 @@ class BatchDeleteConflict(ValueError):
     pass
 
 
+class BatchSplitConflict(ValueError):
+    pass
+
+
+def _batch_split_journal_path() -> Path:
+    target = _BATCHES_JSON.resolve(strict=False)
+    return target.with_name(target.name + ".split.json")
+
+
+def _batch_split_receipt_path(request_id: str) -> Path:
+    # UUID normalization prevents user input from becoming a filesystem path.
+    target = _BATCHES_JSON.resolve(strict=False)
+    return target.with_name(target.name + ".splits") / (str(uuid.UUID(request_id)) + ".json")
+
+
+def _batch_split_identity(row: dict) -> str:
+    material = [row.get("id"), row.get("email"), row.get("created_at")]
+    return hashlib.sha256(json.dumps(material, ensure_ascii=False).encode()).hexdigest()
+
+
+def _recover_registration_batch_split() -> None:
+    """Finish a committed membership-only split, without touching credentials/jobs."""
+    global _BATCH_SPLIT_RECOVERING
+    with _LOCK:
+        if _BATCH_SPLIT_RECOVERING:
+            return
+        journal = _batch_split_journal_path()
+        if not journal.exists():
+            return
+        plan = json.loads(journal.read_text(encoding="utf-8"))
+        if (not isinstance(plan, dict) or plan.get("version") != 1
+                or not isinstance(plan.get("batch"), dict)
+                or not isinstance(plan.get("members"), list) or not plan["members"]
+                or not isinstance(plan.get("receipt"), dict)):
+            raise RuntimeError("账号拆分批次恢复记录无效")
+        target = plan["batch"]
+        target_id = target["batch_id"]
+        receipt_path = _batch_split_receipt_path(target_id)
+        if target.get("split_request_id") != target_id:
+            raise RuntimeError("账号拆分批次恢复标识无效")
+        _BATCH_SPLIT_RECOVERING = True
+        try:
+            accounts, batches = _load_accounts(), _load_batches()
+            by_id = {row["id"]: row for row in accounts}
+            sources = {member["source_batch_id"] for member in plan["members"]}
+            if not sources <= {row.get("batch_id") for row in batches}:
+                raise RuntimeError("账号拆分恢复失败：原批次不存在")
+            current = next((row for row in batches if row.get("batch_id") == target_id), None)
+            if current is not None and current.get("split_request_id") != target_id:
+                raise RuntimeError("账号拆分恢复失败：新批次标识冲突")
+            # Validate the complete selection before writing even the first row.
+            for member in plan["members"]:
+                row = by_id.get(member["id"])
+                if (row is None or _batch_split_identity(row) != member["identity"]
+                        or row.get("registration_batch_id") not in {member["source_batch_id"], target_id}):
+                    raise RuntimeError("账号拆分恢复失败：账号身份或批次已变化")
+            changes = [
+                ({**by_id[member["id"]], "registration_batch_id": target_id,
+                  "updated_at": target["updated_at"]}, by_id[member["id"]])
+                for member in plan["members"]
+                if by_id[member["id"]].get("registration_batch_id") != target_id
+            ]
+            replacements = {row["id"]: row for row, _ in changes}
+            moved = [replacements.get(row["id"], row) for row in accounts]
+            if changes:
+                _save_account_progress_many(moved, changes)
+            counts = {}
+            for row in moved:
+                key = row.get("registration_batch_id")
+                if key in sources:
+                    counts[key] = counts.get(key, 0) + 1
+            updated = [
+                {**row, "count": counts.get(row["batch_id"], 0), "updated_at": target["updated_at"]}
+                if row.get("batch_id") in sources else row for row in batches
+            ]
+            if current is None:
+                updated.append(target)
+            if updated != batches:
+                _save_batches(updated)
+            # A small receipt per request makes manual retries safe even if the
+            # new batch is later merged/deleted. No growing global receipt JSON.
+            if not receipt_path.exists():
+                receipt_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _write_json(receipt_path, plan["receipt"])
+            journal.unlink()
+            with _JSON_CACHE_LOCK:
+                _JSON_CACHE.pop(str(journal), None)
+        finally:
+            _BATCH_SPLIT_RECOVERING = False
+
+
+def split_registration_batch(*, account_ids: list[int], request_id: str) -> dict:
+    """Move only selected imported accounts into a new batch; keep empty sources."""
+    if (not isinstance(account_ids, list) or not 1 <= len(account_ids) <= 5000
+            or any(type(value) is not int or value <= 0 for value in account_ids)):
+        raise ValueError("请选择 1-5000 个有效账号")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-fA-F-]{32,36}", request_id):
+        raise ValueError("拆分请求标识无效，请重新选择账号")
+    try:
+        target_id = str(uuid.UUID(request_id))
+    except ValueError:
+        raise ValueError("拆分请求标识无效，请重新选择账号") from None
+    selected = sorted(set(account_ids))
+    with _LOCK:
+        accounts, batches = _load_accounts(), _load_batches()
+        by_id = {row["id"]: row for row in accounts}
+        if set(selected) - by_id.keys():
+            raise LookupError("部分账号已不存在，请刷新列表后重新选择")
+        members = [{"id": key, "source_batch_id": by_id[key].get("registration_batch_id"),
+                    "identity": _batch_split_identity(by_id[key])} for key in selected]
+        selection_hash = hashlib.sha256(json.dumps(
+            [(row["id"], row["identity"]) for row in members]).encode()).hexdigest()
+        receipt_path = _batch_split_receipt_path(target_id)
+        if receipt_path.exists():
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt.get("selection_hash") != selection_hash:
+                raise BatchSplitConflict("此拆分请求已处理其他账号，请重新选择")
+            if (not any(row.get("batch_id") == target_id for row in batches)
+                    or any(row["source_batch_id"] != target_id for row in members)):
+                raise BatchSplitConflict("本次拆分已完成，但批次或账号已再次调整，请刷新后重新选择")
+            return {**receipt["result"], "already_split": True}
+        batches_by_id = {row["batch_id"]: row for row in batches}
+        if target_id in batches_by_id:
+            raise BatchSplitConflict("新批次标识已存在，请重新选择账号")
+        sources = {row["source_batch_id"] for row in members}
+        if None in sources or "" in sources or sources - batches_by_id.keys():
+            raise BatchSplitConflict("所选账号缺少有效的导入批次，请刷新后重试")
+        if any((row.get("registration_drivers") or [_registration_job_driver(row)]) != ["imported"]
+               for row in (batches_by_id[key] for key in sources)):
+            raise BatchSplitConflict("仅支持拆分账号导入批次，不能操作内部授权或注册批次")
+        targets = [by_id[key] for key in selected]
+        if any(row.get("archived") or row.get("registration_driver") != "imported" for row in targets):
+            raise BatchSplitConflict("仅支持拆分未归档的导入账号，请刷新后重新选择")
+        wanted = set(selected)
+        jobs = [row for row in _load_jobs() if row.get("account_id") in wanted]
+        reason = _batch_delete_block_reason({}, jobs, targets)
+        if reason or any(row.get("quota_status") in {"queued", "running", "retrying"} for row in targets):
+            raise BatchSplitConflict("所选账号仍有进行中的任务，请等待结束后再拆分")
+        batch = _registration_batch_row(
+            batches, batch_id=target_id, count=len(selected), workers=0, email_source="existing_account",
+            flow_snapshot={"registration_driver": "imported", "import_format": "password_totp"},
+        )
+        batch.update(split_request_id=target_id, split_source_batch_ids=sorted(sources))
+        result = {"batch_id": target_id, "source_batch_ids": sorted(sources),
+                  "account_ids": selected, "moved_accounts": len(selected), "already_split": False}
+        # Commit point: subsequent reads/restart roll all remaining steps forward.
+        _write_json(_batch_split_journal_path(), {
+            "version": 1, "batch": batch, "members": members,
+            "receipt": {"selection_hash": selection_hash, "result": result},
+        })
+        _recover_registration_batch_split()
+        return result
+
+
 def delete_registration_batches(*, batch_ids: list[str]) -> dict:
     """Delete selected batches and their local account data with one bulk save.
 
@@ -11527,8 +11725,10 @@ def create_account_codex_jobs_bulk(
             elif (login_mode == "email_otp" and account.get("codex_refresh_token")
                   and (not expected_workspace_id or account.get("codex_workspace_id") == expected_workspace_id)):
                 reason = "已有 Codex RT"
-            elif str(account.get("codex_status") or "").lower() == "deactivated":
-                reason = "账号已废号"
+            elif str(account.get("codex_status") or "").lower() == "deactivated" or account.get("codex_error_code") in {
+                "account_deactivated", "account_deleted", "account_banned",
+            }:
+                reason = "账号已封禁/停用，不再授权"
             elif login_mode == "password_totp":
                 from core.codex_password_totp import login_material, PasswordTotpLoginError
 
@@ -11600,6 +11800,8 @@ def update_job(
     email_allocation_id: int | None = None,
     restart_recoverable: bool | None = None,
     codex_authorization: dict | None = None,
+    codex_error_code: str | None = None,
+    codex_preflight_exhausted: bool | None = None,
 ) -> None:
     with _LOCK:
         rows = _load_jobs()
@@ -11609,6 +11811,8 @@ def update_job(
         previous = dict(row)
         if status is not None:
             row["status"] = status
+            if status in {"pending", "running"} and row.get("codex_preflight_exhausted"):
+                row["codex_preflight_exhausted"] = False
             if status in {"success", "failed", "stopped", "cancelled"} and isinstance(row.get("roxy_traffic"), dict):
                 traffic = row["roxy_traffic"]
                 traffic["registration_outcome"] = status
@@ -11628,6 +11832,11 @@ def update_job(
             row["completed_at"] = completed_at
         if account_id is not None:
             row["account_id"] = account_id
+        if codex_error_code is not None:
+            from core.account_state import UNUSABLE_ACCOUNT_CODES
+            row["codex_error_code"] = codex_error_code if codex_error_code in UNUSABLE_ACCOUNT_CODES else None
+        if codex_preflight_exhausted is not None:
+            row["codex_preflight_exhausted"] = codex_preflight_exhausted is True
         if oauth_status is not None:
             row["oauth_status"] = oauth_status
         if oauth_error is not None:
@@ -11652,6 +11861,9 @@ def update_job(
             _save_job_progress(rows, row, previous)
         else:
             _save_jobs(rows)
+
+    from core import progress_events
+    progress_events.notify('job', int(job_id))
 
 
 def update_jobs_bulk(updates: list[dict]) -> int:
@@ -11722,6 +11934,8 @@ def update_jobs_bulk(updates: list[dict]) -> int:
             # jobs table.  Terminal rows or any result field automatically
             # fall back to the durable main-file checkpoint.
             _save_job_progress_many(rows, changes)
+            from core import progress_events
+            progress_events.notify('job')
         return changed
 
 

@@ -40,6 +40,7 @@ from urllib.parse import urlencode, urlparse, parse_qs, quote, unquote, urljoin
 from config import codex as _cfg
 from config import openai_protocol as _protocol_cfg
 from core.session import BrowserSession
+from core.account_state import unusable_account_code
 from core.humanize import delay as human_delay
 from core.openai_auth import (
     _is_transient_network_error,
@@ -193,6 +194,8 @@ def _next_codex_proxy(
 
 def _oauth_failure_retry_reason(result: dict) -> str:
     """只对会话/出口故障整轮重跑，邮箱和接码平台错误留在各自重试层。"""
+    if unusable_account_code(result):
+        return ""
     if not isinstance(result, dict) or result.get("ok") or result.get("status") != "failed":
         return ""
     stage = str(result.get("failure_stage") or "").strip().lower()
@@ -222,6 +225,22 @@ def _oauth_failure_retry_reason(result: dict) -> str:
     if _is_transient_network_error(RuntimeError(text)):
         return "network"
     return ""
+
+
+def _is_proxy_preflight_failure(result: dict) -> bool:
+    """Only transport failures before OAuth starts get the independent budget.
+
+    Do not infer this from the human-readable, possibly truncated message.
+    In particular, HTTP 403 and failures after submitting credentials are not
+    free retries for the Team authorization coordinator.
+    """
+    return bool(
+        result.get("status") == "failed" and not result.get("ok")
+        and not unusable_account_code(result)
+        and result.get("failure_stage") == "network_preflight"
+        and result.get("error_type") == "ProxyError"
+        and result.get("http_status") in (None, 0, 407)
+    )
 
 
 def _email_otp_error_allows_resend(exc: Exception) -> bool:
@@ -2673,6 +2692,12 @@ def _save_sub2_local_record(
 # 入口
 # ============================================================
 
+def _codex_browser_profile_key() -> str:
+    """仅切换 Codex 两种授权；不改变母号管理或注册的默认画像。"""
+    family = str(getattr(_cfg, "CODEX_BROWSER_FAMILY", "chrome") or "chrome").strip().lower()
+    return {"chrome": "chrome149_reference", "chrome146": "chrome"}.get(family, family)
+
+
 def _run_codex_oauth_once(
     email: str,
     otp_provider=None,
@@ -2712,9 +2737,7 @@ def _run_codex_oauth_once(
     session = None
     stage = "session_init"
     try:
-        browser_family = str(
-            getattr(_cfg, "CODEX_BROWSER_FAMILY", "firefox") or "firefox"
-        ).strip().lower()
+        browser_family = _codex_browser_profile_key()
         session = BrowserSession(proxy=proxy, browser_family=browser_family)
         profile = getattr(session, "browser_profile", {}) or {}
         logger.info(
@@ -2985,7 +3008,8 @@ def _run_codex_oauth_once(
         return _codex_result(
             status="deactivated",
             email=email,
-            message=f"账号已废（{exc.error_code}）",
+            message=f"账号已封禁/停用（{exc.error_code}）",
+            error_code=exc.error_code, retryable=False, failure_stage=stage,
         )
     except sms_provider.SmsBudgetExceededError as exc:
         logger.warning("[Codex] 批次短信预算已耗尽：%s", exc)
@@ -3003,6 +3027,7 @@ def _run_codex_oauth_once(
             email=email,
             message=f"{type(exc).__name__}: {str(exc)[:200]}",
             failure_stage=stage,
+            error_type=type(exc).__name__,
         )
     finally:
         if session is not None:
@@ -3023,7 +3048,7 @@ def run_codex_oauth(
     expected_workspace_id: str = "",
     auto_retry: bool = True,
 ) -> dict:
-    """执行 Codex OAuth，并在出口/会话故障时用全新 Session 整轮恢复。"""
+    """执行 OAuth；auto_retry 只控制业务恢复，代理预检始终单独限次。"""
     if login_mode not in {"email_otp", "password_totp"}:
         raise ValueError("不支持的 Codex 登录模式")
     password_login = None
@@ -3045,6 +3070,7 @@ def run_codex_oauth(
     attempt = 0
     preflight_failures = 0
     flow_failures = 0
+    flow_attempts = 0
 
     while True:
         attempt += 1
@@ -3085,16 +3111,27 @@ def run_codex_oauth(
                 failure_stage="unknown",
             )
         result = dict(result)
+        terminal_code = unusable_account_code(result)
+        if terminal_code:
+            # Apply before either retry policy, including malformed legacy
+            # results that label a ban as failed + retryable HTTP 403.
+            result.update(status="deactivated", ok=False, retryable=False,
+                          error_code=terminal_code,
+                          message=f"账号已封禁/停用（{terminal_code}），不再重试")
         result["oauth_attempts"] = attempt
         last_result = result
 
-        if not auto_retry:
-            # Team-only authorization retries are bounded by the persistent
-            # coordinator; do not multiply them by this recovery loop.
-            return result
         reason = password_login.retry_reason(result) if password_login else _oauth_failure_retry_reason(result)
-        if not reason:
+        proxy_preflight_failure = bool(current_proxy) and _is_proxy_preflight_failure(result)
+        if not proxy_preflight_failure and (not auto_retry or not reason):
+            # Team business retries remain exclusively in the persistent
+            # coordinator. A bad proxy has not started that business attempt.
+            flow_attempts += 1
+            result.update(oauth_flow_attempts=flow_attempts,
+                          proxy_preflight_failures=preflight_failures)
             return result
+        if proxy_preflight_failure:
+            reason = "network"
 
         next_proxy = _next_codex_proxy(
             requested_proxy=proxy,
@@ -3103,8 +3140,8 @@ def run_codex_oauth(
         )
         changed = next_proxy != current_proxy
         stage = str(result.get("failure_stage") or "unknown").strip().lower()
-        is_preflight_proxy_failure = (
-            changed
+        is_preflight_proxy_failure = proxy_preflight_failure or (
+            auto_retry and changed
             and stage in {"session_init", "network_preflight", "bootstrap"}
             and reason in {"network", "edge_rejected", "upstream_http"}
         )
@@ -3113,18 +3150,27 @@ def run_codex_oauth(
             exhausted = preflight_failures >= preflight_max_attempts
             delay = preflight_delay
             retry_scope = "proxy_preflight"
-            retry_progress = f"代理候选 {preflight_failures + 1}/{preflight_max_attempts}"
+            retry_progress = f"代理候选 {preflight_failures + 1}/{preflight_max_attempts}，不占授权重试次数"
         else:
+            flow_attempts += 1
             flow_failures += 1
             exhausted = flow_failures >= flow_max_attempts
             delay = base_delay * flow_failures
             retry_scope = "oauth_flow"
             retry_progress = f"业务恢复 {flow_failures + 1}/{flow_max_attempts}"
 
+        result.update(oauth_flow_attempts=flow_attempts,
+                      proxy_preflight_failures=preflight_failures)
         if exhausted:
             result["retry_exhausted"] = True
             result["retry_reason"] = reason
             result["retry_scope"] = retry_scope
+            if proxy_preflight_failure:
+                result["proxy_preflight_exhausted"] = True
+                result["message"] = (
+                    f"代理预检失败达到上限（{preflight_failures} 次），已停止；"
+                    "预检失败不占授权重试次数：stage=network_preflight error=ProxyError"
+                )
             logger.warning(
                 "[Codex][恢复] 重试已耗尽：attempt=%s scope=%s stage=%s reason=%s "
                 "proxy_failures=%s/%s flow_failures=%s/%s",
@@ -3153,6 +3199,9 @@ def run_codex_oauth(
             delay,
             retry_progress,
         )
+        if password_login:
+            from core import progress_events
+            progress_events.phase('network_preflight' if proxy_preflight_failure else 'retrying')
         _sleep_codex_retry(delay, email)
         current_proxy = next_proxy
 

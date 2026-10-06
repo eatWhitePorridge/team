@@ -108,9 +108,24 @@ def edit_parent(parent_id):
     return jsonify({"ok": True, "item": service.edit_parent(parent_id, _body())})
 
 
+@blueprint.post("/parents/<int:parent_id>/proxy")
+def set_parent_proxy(parent_id):
+    return jsonify({"ok": True, "item": service.set_parent_proxy(parent_id, _body())})
+
+
 @blueprint.delete("/parents/<int:parent_id>")
 def delete_parent(parent_id):
-    store.delete_parent(parent_id)
+    # Retain the existing bodyless DELETE contract for older clients.
+    # New confirmations carry an identity guard; never silently ignore it.
+    expected_email = None
+    if request.get_data(cache=True):
+        data = _body()
+        if data.get("confirm") is not True:
+            raise store.TeamAdminError("请先确认删除母号")
+        expected_email = data.get("expected_email")
+        if not isinstance(expected_email, str) or not expected_email.strip():
+            raise store.TeamAdminError("缺少待删除母号邮箱，请刷新后重试")
+    store.delete_parent(parent_id, expected_email=expected_email)
     return jsonify({"ok": True})
 
 
@@ -138,7 +153,8 @@ def check_member_quota(parent_id, workspace_id):
 
 @blueprint.get("/parents/<int:parent_id>/workspaces/<workspace_id>/invites")
 def invites(parent_id, workspace_id):
-    return _cached_page(parent_id, workspace_id, store.invite_page)
+    return _cached_page(parent_id, workspace_id, store.invite_page, allow_all=True,
+                        seat_type=request.args.get("seat_type", ""), status=request.args.get("status", ""))
 
 
 def _cached_page(parent_id, workspace_id, read_page, *, params=None, allow_all=False, **options):

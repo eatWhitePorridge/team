@@ -1,14 +1,18 @@
 """Opt-in, protocol-only management of multiple Team owner accounts."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 
 from core import account_cookie_store, db, team_admin_store as store
 from core.chatgpt_plan import ACCOUNTS_CHECK_PATH, decode_jwt_payload_unverified, normalize_token
@@ -23,7 +27,6 @@ _LOCKS_GUARD = threading.Lock()
 _WORKSPACE_LOCKS: dict[str, threading.Lock] = {}
 _SEAT_SWITCH_INTERVAL = 10.0
 _SEAT_NEXT_AT: dict[str, float] = {}
-_SEAT_429_MAX_ATTEMPTS = 3
 _SEAT_429_DEFAULT_WAIT = 60.0
 _SEAT_429_MAX_WAIT = 180.0
 _MANAGER_ROLES = {"account-owner", "account-admin"}
@@ -35,9 +38,11 @@ _MEMBER_PAGE_SIZE = 100
 _MEMBER_SNAPSHOT_ATTEMPTS = 3
 _MEMBER_REPAIR_REQUESTS = 8
 _MAX_MEMBERS = 5000
-_INVITE_PAGE_SIZE = 25
-_INVITE_BATCH_SIZE = 25
+_INVITE_PAGE_SIZE = 100
+_INVITE_BATCH_SIZE = 100  # Recipients per POST, not parallel request count.
 _INVITE_REQUEST_TIMEOUT = 60
+_INVITE_SWITCH_CONCURRENCY = 5
+_INVITE_SWITCH_MAX_CONCURRENCY = 20
 _ID = re.compile(r"[A-Za-z0-9_-]{1,200}")
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 
@@ -81,6 +86,9 @@ def _linked_material(parent: dict) -> dict:
 
 
 def add_parent(data: dict) -> dict:
+    proxy_url = data.get("proxy_url")
+    if proxy_url is not None and not isinstance(proxy_url, str):
+        raise TeamAdminError("固定代理地址必须是文本", code="invalid_proxy")
     source = data.get("source_account_id")
     if source is not None:
         if isinstance(source, bool) or not isinstance(source, int) or source < 1:
@@ -99,7 +107,19 @@ def add_parent(data: dict) -> dict:
         "label": _text(data.get("label"), 80), "source_account_id": source,
         "has_access_token": bool(material["access_token"]),
         "has_session": bool(material["session_token"] or material["cookies"]),
-    }, material if source is None else {})
+    }, material if source is None else {}, proxy=proxy_url.strip() if proxy_url and proxy_url.strip() else None)
+
+
+def set_parent_proxy(parent_id: int, data: dict) -> dict:
+    if set(data) - {"confirm", "expected_email", "expected_revision", "action", "proxy_url"}:
+        raise TeamAdminError("固定代理设置包含不支持的字段")
+    if (data.get("confirm") is not True or not isinstance(data.get("expected_email"), str)
+            or not data["expected_email"].strip() or not isinstance(data.get("expected_revision"), str)):
+        raise TeamAdminError("请刷新母号后确认代理设置")
+    if not isinstance(data.get("action"), str):
+        raise TeamAdminError("请选择固定代理来源")
+    return store.set_parent_proxy(parent_id, expected_email=data["expected_email"],
+        expected_revision=data["expected_revision"], action=data["action"], proxy=data.get("proxy_url"))
 
 
 def edit_parent(parent_id: int, data: dict) -> dict:
@@ -124,6 +144,30 @@ def _check_cancel(job_id: str | None):
         raise TeamAdminError("任务已取消；已提交的操作不会撤销", code="cancelled", status=409)
 
 
+def _seat_rate_limit_wait(headers, retry: int) -> float:
+    """Honor Retry-After; cap only our fallback backoff, never a server delay."""
+    raw = str((headers or {}).get("retry-after") or (headers or {}).get("Retry-After") or "").strip()
+    wait = None
+    if raw:
+        try:
+            seconds = float(raw)
+            if math.isfinite(seconds) and seconds >= 0:
+                wait = seconds
+        except (ValueError, TypeError, OverflowError):
+            try:
+                date = parsedate_to_datetime(raw)
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                wait = max(0.0, date.timestamp() - time.time())
+            except (ValueError, TypeError, OverflowError):
+                pass
+    if wait is None:
+        # Bounded exponent even when a workspace remains limited for hours.
+        wait = min(_SEAT_429_MAX_WAIT, _SEAT_429_DEFAULT_WAIT * (2 ** min(max(retry - 1, 0), 8)))
+    # Even Retry-After: 0 must not create a rapid retry loop.
+    return max(_SEAT_SWITCH_INTERVAL, wait)
+
+
 class RemoteError(TeamAdminError):
     def __init__(self, message: str, http_status: int = 0):
         super().__init__(message, code=f"upstream_{http_status}", status=422)
@@ -139,23 +183,119 @@ class MemberPaginationError(RemoteError):
     """An inconsistent member scan that can be retried from offset zero."""
 
 
+class _InviteSeatControl:
+    """Parallel invitation writes, with shared cooldown and prompt stop checks."""
+
+    def __init__(self, workspace_id: str):
+        self.workspace_id = workspace_id
+        self.stopped = threading.Event()
+        self.throttled = False
+        self.retries = 0
+        self.on_progress = lambda: None
+
+    def check(self, client):
+        _check_cancel(client.job_id)
+        if self.stopped.is_set():
+            raise TeamAdminError("邀请切席已停止派发，正在收集已发送请求的结果",
+                                 code="invite_switch_stopped", status=409)
+
+    def wait(self, client):
+        while True:
+            self.check(client)
+            with _LOCKS_GUARD:
+                now = time.monotonic()
+                remaining = _SEAT_NEXT_AT.get(self.workspace_id, 0) - now
+                if remaining <= 0:
+                    # No artificial spacing on the normal parallel path. Once
+                    # limited, pace all retries/new writes to avoid a retry wave.
+                    if self.throttled:
+                        _SEAT_NEXT_AT[self.workspace_id] = now + _SEAT_SWITCH_INTERVAL
+                    return
+            time.sleep(min(remaining, 0.25))
+
+    def rate_limited(self, wait: float, retry: int):
+        with _LOCKS_GUARD:
+            self.throttled = True
+            self.retries = max(self.retries, retry)
+            _SEAT_NEXT_AT[self.workspace_id] = max(
+                _SEAT_NEXT_AT.get(self.workspace_id, 0), time.monotonic() + wait,
+            )
+        self.on_progress()
+
+    def message(self, completed: int, total: int, running: int, concurrency: int) -> str:
+        message = f"已处理 {completed}/{total} 条待接受邀请 · 执行 {running}/{concurrency}"
+        with _LOCKS_GUARD:
+            remaining = max(0, _SEAT_NEXT_AT.get(self.workspace_id, 0) - time.monotonic())
+            if self.throttled and remaining > 0:
+                message += f"；HTTP 429，工作区冷却 {remaining:g} 秒（第 {self.retries} 次重试），可取消"
+            elif self.throttled:
+                message += "；限流后降速执行，可取消"
+        return message
+
+
 class TeamAdminClient:
     def __init__(self, parent: dict, job_id: str = ""):
         self.parent = parent
         self.job_id = job_id
         self.workspace_id = ""
-        self.material = _linked_material(parent) if parent.get("source_account_id") else store.credentials(parent["id"])
-        self.token = self.material.get("access_token") or ""
-        self.env = BrowserSession(detect_exit_geo=False)
-        for cookie in self.material.get("cookies") or []:
-            if cookie.get("expires", -1) not in (None, -1, 0) and float(cookie["expires"]) < time.time():
-                continue
-            self.env.session.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie.get("path") or "/", secure=bool(cookie.get("secure")) or cookie["name"].startswith(("__Secure-", "__Host-")))
-        if self.material.get("session_token"):
-            self.env.session.cookies.set("__Secure-next-auth.session-token", self.material["session_token"], domain="chatgpt.com", path="/", secure=True)
+        self._invite_seat_control = None
+        self.env = None
+        self._closed = False
+        self._proxy_scope = store.parent_proxy_session(parent["id"], expected_email=parent["email"])
+        proxy = self._proxy_scope.__enter__()
+        try:
+            self.material = _linked_material(parent) if parent.get("source_account_id") else store.credentials(parent["id"])
+            self.token = self.material.get("access_token") or ""
+            # Always explicit and non-empty: never select a fresh pool entry or
+            # fall back to direct when the saved proxy is unavailable.
+            self.env = BrowserSession(proxy=proxy, detect_exit_geo=False)
+            for cookie in self.material.get("cookies") or []:
+                if cookie.get("expires", -1) not in (None, -1, 0) and float(cookie["expires"]) < time.time():
+                    continue
+                self.env.session.cookies.set(cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie.get("path") or "/", secure=bool(cookie.get("secure")) or cookie["name"].startswith(("__Secure-", "__Host-")))
+            if self.material.get("session_token"):
+                self.env.session.cookies.set("__Secure-next-auth.session-token", self.material["session_token"], domain="chatgpt.com", path="/", secure=True)
+        except BaseException:
+            self.close()
+            raise
 
     def close(self):
-        self.env.session.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self.env is not None:
+                self.env.session.close()
+        finally:
+            scope, self._proxy_scope = self._proxy_scope, None
+            if scope is not None:
+                scope.__exit__(None, None, None)
+
+    def fork_for_invites(self):
+        """One transport per worker, retaining the verified token/proxy context."""
+        child = TeamAdminClient.__new__(TeamAdminClient)
+        child.parent, child.material = dict(self.parent), copy.deepcopy(self.material)
+        child.job_id, child.workspace_id, child.token = self.job_id, self.workspace_id, self.token
+        child._invite_seat_control = None
+        child.env = None
+        child._closed = False
+        child._proxy_scope = store.parent_proxy_session(self.parent["id"], expected_email=self.parent["email"])
+        proxy = child._proxy_scope.__enter__()
+        try:
+            if self._closed or proxy != self.env.proxy:
+                raise TeamAdminError("母号代理会话已变化，请重新提交任务", code="parent_proxy_changed", status=409)
+            child.env = BrowserSession(proxy=proxy, detect_exit_geo=False,
+                                       device_id=self.env.device_id, browser_family=self.env.browser_family)
+            child.env.session.cookies.clear()
+            for cookie in self.env.session.cookies.jar:
+                child.env.session.cookies.jar.set_cookie(copy.deepcopy(cookie))
+            for name in ("browser_profile", "oai_session_id", "chatgpt_client_observation"):
+                if hasattr(self.env, name):
+                    setattr(child.env, name, copy.deepcopy(getattr(self.env, name)))
+        except BaseException:
+            child.close()
+            raise
+        return child
 
     def _token_email(self) -> str:
         claims = decode_jwt_payload_unverified(self.token)
@@ -200,14 +340,22 @@ class TeamAdminClient:
 
     def request(self, method: str, path: str, *, params=None, body=None, retry_auth: bool = True,
                 retry_rate_limit: bool = False, timeout: float = 20) -> dict:
+        if method not in {"GET", "POST", "DELETE", "PATCH"}:
+            raise TeamAdminError("不支持的母号管理请求方法")
         if not self.token:
             self._refresh()
         token_email = self._token_email()
         if token_email:
             self._check_email(token_email)
-        rate_limit_attempts = _SEAT_429_MAX_ATTEMPTS if retry_rate_limit else 1
-        for attempt in range(max(2 if method == "GET" else 1, rate_limit_attempts)):
+        read_retries = 0
+        rate_limit_retries = 0
+        while True:
             _check_cancel(self.job_id)
+            invite_control = getattr(self, "_invite_seat_control", None) if retry_rate_limit else None
+            if invite_control is not None:
+                invite_control.wait(self)
+                invite_control.on_progress()
+                invite_control.check(self)
             headers = self.env.get_chatgpt_headers("https://chatgpt.com/admin/members")
             headers.update({"authorization": f"Bearer {self.token}", "origin": "https://chatgpt.com"})
             if self.workspace_id:
@@ -217,34 +365,44 @@ class TeamAdminClient:
                     resp = self.env.get("https://chatgpt.com" + path, headers=headers, params=params, allow_redirects=False, timeout=timeout)
                 elif method == "DELETE":
                     resp = self.env.delete("https://chatgpt.com" + path, headers=headers, allow_redirects=False, timeout=timeout)
+                elif method == "PATCH":
+                    resp = self.env.patch("https://chatgpt.com" + path, headers=headers, json=body, allow_redirects=False, timeout=timeout)
                 else:
                     resp = self.env.post("https://chatgpt.com" + path, headers=headers, json=body, allow_redirects=False, timeout=timeout)
             except Exception:
-                if method == "GET" and attempt == 0:
+                if method == "GET" and read_retries == 0:
+                    read_retries += 1
                     continue
                 raise RemoteError("母号管理网络请求失败；未自动重试写入操作") from None
             status = int(resp.status_code)
             if status == 401 and method == "GET" and retry_auth:
                 self._refresh()
                 return self.request(method, path, params=params, retry_auth=False, timeout=timeout)
-            if status >= 500 and method == "GET" and attempt == 0:
+            if status >= 500 and method == "GET" and read_retries == 0:
+                read_retries += 1
                 continue
-            if status == 429 and retry_rate_limit and attempt + 1 < rate_limit_attempts:
-                response_headers = getattr(resp, "headers", {}) or {}
-                raw_wait = response_headers.get("retry-after") or response_headers.get("Retry-After") or ""
-                try:
-                    wait = float(str(raw_wait).strip())
-                except (TypeError, ValueError):
-                    wait = _SEAT_429_DEFAULT_WAIT * (2 ** attempt)
-                wait = max(0.0, min(_SEAT_429_MAX_WAIT, wait))
-                logger.warning("[母号管理] 席位写入收到 429，冷却 %.1fs 后重试 attempt=%s/%s workspace=%s",
-                               wait, attempt + 1, rate_limit_attempts, self.workspace_id)
+            if status == 429 and retry_rate_limit:
+                rate_limit_retries += 1
+                wait = _seat_rate_limit_wait(getattr(resp, "headers", {}), rate_limit_retries)
+                logger.warning("[母号管理] 席位写入收到 429，冷却 %.1fs 后继续重试 retry=%s workspace=%s",
+                               wait, rate_limit_retries, self.workspace_id)
+                if invite_control is not None:
+                    invite_control.rate_limited(wait, rate_limit_retries)
+                    continue
                 with _LOCKS_GUARD:
                     _SEAT_NEXT_AT[self.workspace_id] = max(
                         _SEAT_NEXT_AT.get(self.workspace_id, 0), time.monotonic() + wait
                     )
                 _check_cancel(self.job_id)
-                time.sleep(wait)
+                if self.job_id:
+                    store.update_job(self.job_id, message=(
+                        f"席位切换收到 HTTP 429，等待 {wait:g} 秒后继续重试（第 {rate_limit_retries} 次）；可手动取消"
+                    ))
+                # Same workspace-wide limiter as the first write. Waiting is
+                # cancellable, and flow_id / mutation_attempt_id stay unchanged.
+                _wait_seat_switch_slot(self)
+                if self.job_id:
+                    store.update_job(self.job_id, message=f"正在重试席位切换（第 {rate_limit_retries} 次）")
                 continue
             if not 200 <= status < 300:
                 message = {401: "母号登录态失效", 403: "当前请求被拒绝，请检查管理权限或网络出口", 429: "母号管理请求被限流"}.get(status, "母号管理接口请求失败")
@@ -256,7 +414,6 @@ class TeamAdminClient:
             if not isinstance(data, dict):
                 raise RemoteError("母号管理接口未返回 JSON 对象", status)
             return data
-        raise RemoteError("母号管理请求未完成")
 
     def discover(self) -> list[dict]:
         data = self.request("GET", ACCOUNTS_CHECK_PATH)
@@ -477,19 +634,29 @@ class TeamAdminClient:
     def invites(self) -> list[dict]:
         found = {}
         offset = 0
+        initial_total = None
         for _ in range(200):
             data = self.request("GET", f"/backend-api/accounts/{self.workspace_id}/invites",
                                 params={"offset": offset, "limit": _INVITE_PAGE_SIZE, "query": ""})
             items, total = data.get("items"), data.get("total")
             if not isinstance(items, list) or type(total) is not int or not 0 <= total <= _MAX_MEMBERS:
                 raise RemoteError("邀请分页响应无效或超过 5000 条，保留上次完整缓存")
+            if initial_total is not None and total != initial_total:
+                raise RemoteError("邀请总数在分页期间变化，保留上次完整缓存，请重新同步")
+            initial_total = total
             before = len(found)
             for item in items:
                 invite = _normalize_invite(item)
+                if invite["id"] in found:
+                    raise RemoteError("邀请分页出现重复记录，保留上次完整缓存")
                 found[invite["id"]] = invite
             if len(found) > _MAX_MEMBERS:
                 raise RemoteError("邀请数量超过 5000 条，保留上次完整缓存")
-            if len(found) >= total:
+            if len(found) > total:
+                raise RemoteError("邀请记录数超过声明总数，保留上次完整缓存")
+            if self.job_id:
+                store.update_job(self.job_id, message=f"正在同步邀请：已读取 {len(found)}/{total} 条")
+            if len(found) == total:
                 return list(found.values())
             if not items or len(found) == before:
                 raise RemoteError("邀请分页未前进，保留上次完整缓存")
@@ -663,6 +830,130 @@ def _switch(client: TeamAdminClient, member: dict, target: str) -> dict:
     return {**result, "status": "success", "message": "切换接口已确认成功；成员列表待手动同步"}
 
 
+def _switch_invite(client: TeamAdminClient, invite: dict, target: str) -> dict:
+    """PATCH the invitation ID, never the user ID or the invitation POST endpoint."""
+    result = {"invite_id": invite["id"], "email": invite["email"], "target": target}
+    if invite.get("seat_type") == target:
+        return {**result, "status": "unchanged", "message": "邀请已是目标席位"}
+    if getattr(client, "_invite_seat_control", None) is None:
+        _wait_seat_switch_slot(client)
+    store.mark_invites_stale(client.workspace_id)
+    try:
+        response = client.request("PATCH", f"/backend-api/accounts/{client.workspace_id}/invites/{invite['id']}",
+                                  body={"seat_type": target}, retry_rate_limit=True)
+        if response.get("success") is not True:
+            raise TeamAdminError("邀请席位接口未确认成功", code="invite_switch_rejected", status=422)
+    except RemoteError as exc:
+        if 300 <= exc.http_status < 500:
+            raise
+        raise SeatUnconfirmedError(exc) from None
+    if getattr(client, "_invite_seat_control", None) is None:
+        with _LOCKS_GUARD:
+            _SEAT_NEXT_AT[client.workspace_id] = max(
+                _SEAT_NEXT_AT.get(client.workspace_id, 0), time.monotonic() + _SEAT_SWITCH_INTERVAL,
+            )
+    message = "邀请切席接口已确认成功"
+    try:
+        store.update_invite(client.parent["id"], client.workspace_id,
+                            {**invite, "seat_type": target, "observed_at": store.now()})
+    except Exception as exc:
+        # The write already succeeded remotely; never turn a cache failure into
+        # a reason to repeat it or to report the acknowledged change as failed.
+        logger.warning("[母号管理] 邀请切席缓存更新失败 parent=%s error=%s", client.parent["id"], type(exc).__name__)
+        message += "；本地缓存未更新，请手动同步邀请"
+    return {**result, "status": "success", "message": message}
+
+
+def _run_invite_switches(client: TeamAdminClient, job: dict, results: list[dict]) -> str:
+    # One complete snapshot before the first mutation. No post-mutation reads.
+    indexed = {item["id"]: item for item in _sync_invites(client)}
+    ids = iter(job["invite_ids"])
+    concurrency = min(job.get("concurrency", _INVITE_SWITCH_CONCURRENCY),
+                      _INVITE_SWITCH_MAX_CONCURRENCY, len(job["invite_ids"]))
+    control = _InviteSeatControl(client.workspace_id)
+    guard = threading.RLock()
+    inflight: dict[str, dict] = {}
+    errors: list[Exception] = []
+
+    def publish():
+        with guard:
+            store.update_job(job["id"], results=results, completed=len(results),
+                             running=len(inflight), concurrency=concurrency,
+                             inflight_invites=list(inflight.values()),
+                             message=control.message(len(results), len(job["invite_ids"]), len(inflight), concurrency))
+
+    control.on_progress = publish
+    publish()
+
+    def worker():
+        worker_client = None
+        invite = None
+        try:
+            # Reuse the already verified session only when no other worker can
+            # touch it. Parallel workers create AND close their own curl session.
+            worker_client = client if concurrency == 1 else client.fork_for_invites()
+            worker_client._invite_seat_control = control
+            while True:
+                with guard:
+                    control.check(worker_client)
+                    invite_id = next(ids, None)
+                    if invite_id is None:
+                        return
+                    invite = indexed.get(invite_id)
+                    if not invite or invite.get("status") != 2:
+                        results.append({"invite_id": invite_id, "email": (invite or {}).get("email", ""),
+                                        "status": "skipped", "message": "邀请不存在或已不在待接受状态，未修改"})
+                        invite = None
+                        publish()
+                        continue
+                    inflight[invite_id] = {"invite_id": invite_id, "email": invite["email"], "target": job["seat_type"]}
+                    publish()
+                result = _switch_invite(worker_client, invite, job["seat_type"])
+                # An in-flight response is retained even after another worker
+                # fails or the user cancels. Never discard an acknowledged write.
+                with guard:
+                    results.append(result)
+                    inflight.pop(invite_id, None)
+                    invite = None
+                    publish()
+                # This worker immediately takes the next item; no batch barrier.
+        except Exception as exc:
+            control.stopped.set()
+            with guard:
+                stopped = isinstance(exc, TeamAdminError) and exc.code in {"cancelled", "invite_switch_stopped"}
+                if not (isinstance(exc, TeamAdminError) and exc.code == "invite_switch_stopped"):
+                    errors.append(exc)
+                if invite is not None:
+                    if not stopped:
+                        results.append({"invite_id": invite["id"], "email": invite["email"],
+                                        "status": "unconfirmed" if isinstance(exc, SeatUnconfirmedError) else "failed",
+                                        "message": str(exc) if isinstance(exc, TeamAdminError) else f"邀请切席失败：{type(exc).__name__}"})
+                    inflight.pop(invite["id"], None)
+                publish()
+        finally:
+            if worker_client is client:
+                client._invite_seat_control = None
+            elif worker_client is not None:
+                try:
+                    worker_client.close()
+                except Exception:
+                    logger.warning("[母号管理] 邀请切席工作会话关闭失败")
+
+    if concurrency == 1:
+        worker()
+    else:
+        # Long-lived worker loops preserve keepalive, with only N futures, not
+        # one queued future per invitation. Join before releasing workspace lock.
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="invite-seat") as executor:
+            futures = [executor.submit(worker) for _ in range(concurrency)]
+            for future in futures:
+                future.result()
+    if errors:
+        raise errors[0]
+    _check_cancel(job["id"])
+    return f"已处理 {len(results)} 条待接受邀请；未回查或重新发送邀请"
+
+
 def _remove(client: TeamAdminClient, member: dict) -> dict:
     """Remove one member; a successful upstream response is the confirmation."""
     result = {"user_id": member["id"], "email": member["email"], "target": "removed"}
@@ -743,7 +1034,12 @@ def check_workspace_expiration(parent_id: int, workspace_id: str) -> dict:
         checked_at = store.now()
         store.update_workspace(parent_id, workspace_id, {
             "renewal_date": renewal_date,
+            # Keep the preview result separate from entitlement discovery,
+            # which may later return an empty renewal_date or only expires_at.
+            # Preserve the original offset; display conversion belongs to UI.
+            "billing_renewal_date": renewal_date,
             "expiration_checked_at": checked_at,
+            "expiration_succeeded_at": checked_at,
             "expiration_error": "",
         })
         logger.info("[母号管理] 订阅到期时间已更新 parent=%s workspace=%s renewal_date=%s",
@@ -801,18 +1097,19 @@ def _run(job_id: str):
             workspace = next((row for row in spaces if row["id"] == job["workspace_id"]), None)
             if not workspace or not workspace["can_manage"]:
                 raise TeamAdminError("当前母号没有这个工作区的管理权限", code="workspace_forbidden", status=422)
-            if job["kind"] in {"switch", "invite"}:
+            if job["kind"] in {"switch", "invite", "invite_switch"}:
                 _require_seat_support(workspace, job["seat_type"])
             client.workspace_id = workspace["id"]
-            if job["kind"] in {"switch", "remove", "invite", "schedule"}:
+            if job["kind"] in {"switch", "remove", "invite", "invite_switch", "schedule"}:
                 with _LOCKS_GUARD:
                     lock = _WORKSPACE_LOCKS.setdefault(client.workspace_id, threading.Lock())
                 store.update_job(job_id, message="等待当前工作区的成员管理操作")
                 while not lock.acquire(timeout=0.25):
                     _check_cancel(job_id)
                 held = lock
-            store.update_job(job_id, message="正在同步邀请" if job["kind"] == "invites" else "正在同步成员")
-            members = [] if job["kind"] == "invites" else _sync_members(client)
+            invitation_only = job["kind"] in {"invites", "invite_switch"}
+            store.update_job(job_id, message="正在同步邀请" if invitation_only else "正在同步成员")
+            members = [] if invitation_only else _sync_members(client)
             if job["kind"] == "schedule":
                 from core import team_schedule_service
                 team_schedule_service.run(client, job, members, workspace)
@@ -822,6 +1119,9 @@ def _run(job_id: str):
                 done_message = f"已同步 {len(members)} 名成员"
             elif job["kind"] == "invites":
                 done_message = f"已同步 {len(_sync_invites(client))} 条邀请"
+                store.update_job(job_id, total=1, completed=1)
+            elif job["kind"] == "invite_switch":
+                done_message = _run_invite_switches(client, job, results)
             elif job["kind"] == "invite":
                 done_message = _run_invitations(client, job, results, members)
             if job["kind"] in {"switch", "remove"}:
@@ -876,12 +1176,12 @@ def _run(job_id: str):
                         result.update(account_id=account_target["account_id"], email=account_target["email"])
                     results.append(result)
                     store.update_job(job_id, results=results, completed=len(results), message=f"已处理 {len(results)}/{len(job['user_ids'])}")
-            if job["kind"] != "switch":
+            if job["kind"] not in {"switch", "invite_switch", "invites"}:
                 _sync_seat_summary(client)
         _check_cancel(job_id)
         failed = sum(row["status"] not in {"success", "unchanged"} for row in results)
         store.set_parent_state(job["parent_id"], "ready")
-        failed_message = f"{failed} 个邮箱未确认成功" if job["kind"] == "invite" else f"{failed} 个成员未确认成功"
+        failed_message = f"{failed} 条邀请未确认成功" if job["kind"] in {"invite", "invite_switch"} else f"{failed} 个成员未确认成功"
         store.update_job(job_id, status="partial" if failed else "success", message=failed_message if failed else done_message, finished_at=store.now())
         logger.info("[母号管理] 任务完成 parent=%s kind=%s status=%s", job["parent_id"], job["kind"], "partial" if failed else "success")
     except Exception as exc:
@@ -992,7 +1292,7 @@ def enqueue_account_invitations(parent_id: int, data: dict) -> dict:
 
 def enqueue(parent_id: int, data: dict) -> dict:
     kind = data.get("kind")
-    if not isinstance(kind, str) or kind not in {"discover", "members", "switch", "remove", "invite", "invites"}:
+    if not isinstance(kind, str) or kind not in {"discover", "members", "switch", "remove", "invite", "invites", "invite_switch"}:
         raise TeamAdminError("不支持的母号管理操作")
     workspace_id = str(data.get("workspace_id") or "")
     if kind != "discover" and not _ID.fullmatch(workspace_id):
@@ -1001,16 +1301,28 @@ def enqueue(parent_id: int, data: dict) -> dict:
     target = str(data.get("seat_type") or "")
     invite_fields = {}
     if kind in {"switch", "remove"}:
-        max_members = 200 if kind == "switch" else None
         if (not isinstance(user_ids, list) or not user_ids
-                or (max_members is not None and len(user_ids) > max_members)
                 or any(not isinstance(v, str) or not _ID.fullmatch(v) for v in user_ids)):
-            raise TeamAdminError("一次请选择 1-200 个成员" if max_members else "一次至少选择 1 个成员")
+            raise TeamAdminError("一次至少选择 1 个有效成员")
         if kind == "switch" and target not in _SEAT_TYPES:
             raise TeamAdminError("目前仅支持 default、usage_based 和 prolite 席位")
         if kind == "remove":
             target = ""
         user_ids = list(dict.fromkeys(user_ids))
+    elif kind == "invite_switch":
+        invite_ids = data.get("invite_ids")
+        if (not isinstance(invite_ids, list) or not invite_ids
+                or any(not isinstance(value, str) or not _ID.fullmatch(value) for value in invite_ids)):
+            raise TeamAdminError("一次至少选择 1 条有效的待接受邀请")
+        if data.get("user_ids"):
+            raise TeamAdminError("待邀请切席必须使用邀请 ID，不能使用成员 ID")
+        if target not in _SEAT_TYPES:
+            raise TeamAdminError("目前仅支持 default、usage_based 和 prolite 席位")
+        concurrency = data.get("concurrency", _INVITE_SWITCH_CONCURRENCY)
+        if type(concurrency) is not int or not 1 <= concurrency <= _INVITE_SWITCH_MAX_CONCURRENCY:
+            raise TeamAdminError(f"邀请切席并发需为 1-{_INVITE_SWITCH_MAX_CONCURRENCY} 的整数")
+        invite_fields = {"invite_ids": list(dict.fromkeys(invite_ids)), "concurrency": concurrency}
+        user_ids = []
     elif kind == "invite":
         emails = data.get("email_addresses")
         if not isinstance(emails, list) or not 1 <= len(emails) <= 200:
@@ -1030,7 +1342,7 @@ def enqueue(parent_id: int, data: dict) -> dict:
         user_ids = []
     else:
         user_ids, target = [], ""
-    if kind in {"switch", "invite"} and target == "usage_based":
+    if kind in {"switch", "invite", "invite_switch"} and target == "usage_based":
         workspace = next((item for item in store.workspaces(parent_id) if item["id"] == workspace_id), None)
         # Legacy snapshots may lack this field; the worker rechecks live discovery.
         if workspace is not None and workspace.get("is_usage_based_seat_enabled") is False:
@@ -1063,4 +1375,4 @@ def _enqueue_job(parent_id: int, kind: str, workspace_id: str, user_ids: list[st
         if job:
             store.update_job(job["id"], status="failed", message="任务入队失败")
         raise
-    return {k: v for k, v in job.items() if k not in {"user_ids", "results", "email_addresses", "inflight_emails", "removal_plan", "account_plan"}}
+    return {k: v for k, v in job.items() if k not in {"user_ids", "invite_ids", "inflight_invites", "results", "email_addresses", "inflight_emails", "removal_plan", "account_plan"}}

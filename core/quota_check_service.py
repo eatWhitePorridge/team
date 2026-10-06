@@ -60,14 +60,14 @@ def _wait_for_rate_slot() -> None:
         time.sleep(scheduled - now)
 
 
-def _number(value: Any, *, integer: bool = False) -> int | float | None:
+def _number(value: Any, *, integer: bool = False, nonnegative: bool = True) -> int | float | None:
     if isinstance(value, bool):
         return None
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    if not math.isfinite(parsed) or parsed < 0 or (integer and not parsed.is_integer()):
+    if not math.isfinite(parsed) or (nonnegative and parsed < 0) or (integer and not parsed.is_integer()):
         return None
     return int(parsed) if integer else parsed
 
@@ -109,19 +109,27 @@ def _rate_limit(value: Any, now: int) -> dict | None:
 def parse_usage(data: Any, *, now: int | None = None) -> dict:
     """Preserve absent windows as unknown, never fabricate a zero usage value."""
     if not isinstance(data, dict) or data.get("error") or not any(
-        key in data for key in ("rate_limit", "additional_rate_limits", "rate_limit_reset_credits")
+        key in data for key in ("rate_limit", "additional_rate_limits", "rate_limit_reset_credits", "credits")
     ):
         raise ValueError("额度接口未返回有效的额度结构")
     if "rate_limit" in data and data["rate_limit"] is not None and not isinstance(data["rate_limit"], dict):
         raise ValueError("额度窗口结构无效")
+    if "credits" in data and data["credits"] is not None and not isinstance(data["credits"], dict):
+        raise ValueError("点数余额结构无效")
     now = int(time.time()) if now is None else now
     rate = _rate_limit(data.get("rate_limit"), now) or {}
+    credits = data.get("credits") if isinstance(data.get("credits"), dict) else {}
     result = {
         "ok": True,
         "checked_at": datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
         "quota_plan_type": str(data.get("plan_type") or "").strip()[:80] or None,
         "quota_allowed": rate.get("allowed"),
         "quota_limit_reached": rate.get("limit_reached"),
+        # Usage-based seats may return rate_limit=null and only a credits balance.
+        # Reset credits below are reset COUNTS, not spendable credits/balance.
+        "quota_credits_balance": _number(credits.get("balance"), nonnegative=False),
+        "quota_credits_has_credits": _bool(credits.get("has_credits")),
+        "quota_credits_unlimited": _bool(credits.get("unlimited")),
         "quota_additional_rate_limits": [],
     }
     for name in ("primary", "secondary"):

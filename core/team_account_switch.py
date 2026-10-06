@@ -12,9 +12,6 @@ import json
 from core import db, team_account_removal as removal, team_admin_store as store
 
 Error = store.TeamAdminError
-# Seat switching keeps its existing bounded request size; account removal is
-# intentionally unbounded and does not use this value.
-MAX_ACCOUNTS = 5000
 SEAT_TYPES = {"default", "usage_based", "prolite"}
 
 
@@ -43,8 +40,6 @@ def preview(parent_id: int, data: dict) -> dict:
     accounts = db.get_team_removal_candidates(**scope)
     if not accounts:
         raise Error("所选批次或账号中没有本地账号", code="accounts_missing", status=404)
-    if len(accounts) > MAX_ACCOUNTS:
-        raise Error(f"一次最多处理 {MAX_ACCOUNTS} 个账号，请在账号页分批选择")
     items, seen = [], set()
     for account in accounts:
         item = {"account_id": account["id"], "email": str(account.get("email") or ""),

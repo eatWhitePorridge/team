@@ -36,6 +36,11 @@ FIREFOX_USER_AGENT = (
     "Gecko/20100101 Firefox/147.0"
 )
 
+# Codex 的可选参考画像，不修改注册/2FA 共用的 Chrome 146 默认值。
+# 对照 maile456/codex-auto-sms-receiver @1366a715 的 config/browser.py。
+# 该仓库有意组合 chrome146 TLS 与 Chrome 149 HTTP/JS；保留一致性告警。
+CHROME149_REFERENCE_PROFILE = "chrome149_reference"
+
 SAFARI_VERSION = ""
 SAFARI_WEBKIT_VERSION = "537.36"
 MAC_OS_UA_VERSION = "10_15_7"
@@ -155,8 +160,11 @@ def extract_proxy_region(proxy: str | None) -> str:
     return ""
 
 
-def _locale_profile_key_from_geo(geo: dict | None, region: str | None = None) -> str:
-    if AUTO_BROWSER_LOCALE_FROM_IP:
+def _locale_profile_key_from_geo(
+    geo: dict | None, region: str | None = None, *, auto_from_ip: bool | None = None,
+) -> str:
+    auto = AUTO_BROWSER_LOCALE_FROM_IP if auto_from_ip is None else auto_from_ip
+    if auto:
         if geo:
             country = str(geo.get("country") or geo.get("country_code") or "").upper()
             if country in COUNTRY_LOCALE_PROFILE_MAP:
@@ -167,10 +175,13 @@ def _locale_profile_key_from_geo(geo: dict | None, region: str | None = None) ->
     return BROWSER_LOCALE_PROFILE
 
 
-def _build_locale_from_geo(geo: dict | None, region: str | None = None) -> dict:
-    key = _locale_profile_key_from_geo(geo, region)
+def _build_locale_from_geo(
+    geo: dict | None, region: str | None = None, *, auto_from_ip: bool | None = None,
+) -> dict:
+    auto = AUTO_BROWSER_LOCALE_FROM_IP if auto_from_ip is None else auto_from_ip
+    key = _locale_profile_key_from_geo(geo, region, auto_from_ip=auto)
     locale = dict(BROWSER_LOCALE_PROFILES.get(key, BROWSER_LOCALE_PROFILES[BROWSER_LOCALE_PROFILE]))
-    if geo and AUTO_BROWSER_LOCALE_FROM_IP:
+    if geo and auto:
         tz = str(geo.get("timezone") or "").strip()
         if tz:
             locale["timezone_iana"] = tz
@@ -278,9 +289,17 @@ def build_browser_environment(
 ) -> dict:
     """构建完整浏览器环境画像，作为所有指纹字段的单一数据源。"""
     family = str(browser_family or BROWSER_FAMILY).strip().lower()
+    reference_chrome = family == CHROME149_REFERENCE_PROFILE
+    if reference_chrome:
+        family = "chrome"
     if family not in {"chrome", "firefox"}:
         raise ValueError(f"不支持的浏览器画像: {family!r}")
-    locale = _build_locale_from_geo(geo, region)
+    if reference_chrome:
+        # 参考仓库跟随实际 GeoIP（不使用代理用户名猜测国家），无 GeoIP 则回退配置。
+        locale = _build_locale_from_geo(geo, auto_from_ip=True)
+        locale["navigator_languages"] = [locale["navigator_language"]]
+    else:
+        locale = _build_locale_from_geo(geo, region)
     profile = dict(base_profile or random.choice(BROWSER_PROFILE_POOL))
     if family == "firefox":
         identity = {
@@ -328,6 +347,20 @@ def build_browser_environment(
             "navigator_proto_samples": list(NAVIGATOR_PROTO_SAMPLES),
             "window_key_samples": list(WINDOW_KEY_SAMPLES),
         }
+        if reference_chrome:
+            identity.update({
+                "profile_name": CHROME149_REFERENCE_PROFILE,
+                "chrome_major": "149",
+                "chrome_full_version": "149.0.0.0",
+                "impersonate": "chrome146",
+                "user_agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/149.0.0.0 Safari/537.36"
+                ),
+                "sec_ch_ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                "sec_ch_ua_full_version_list": '"Google Chrome";v="149.0.0.0", "Chromium";v="149.0.0.0", "Not)A;Brand";v="24.0.0.0"',
+            })
     profile.update({
         "locale_profile": locale.get("locale_profile", BROWSER_LOCALE_PROFILE),
         "geo": dict(geo or {}),

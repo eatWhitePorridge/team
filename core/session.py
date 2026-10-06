@@ -50,7 +50,7 @@ class BrowserSession:
             detect_exit_geo: 是否探测出口 IP 并自动选择语言/时区画像。
                              套餐查询等短请求可关闭，避免额外网络等待。
             device_id: 可选的既有 oai-did。注册后复查可用它保持设备上下文。
-            browser_family: 可选的网络/JS 浏览器画像，目前支持 chrome、firefox。
+            browser_family: chrome、firefox，或 Codex 专用 chrome149_reference 参考画像。
         """
         # proxy=None  → 从池里随机抽（默认行为）
         # proxy=""    → 禁用代理（直连）
@@ -60,7 +60,9 @@ class BrowserSession:
         else:
             self.proxy = proxy
 
-        self.browser_family = str(browser_family or _browser_cfg.BROWSER_FAMILY).strip().lower()
+        self.browser_profile_key = str(browser_family or _browser_cfg.BROWSER_FAMILY).strip().lower()
+        reference_chrome = self.browser_profile_key == _browser_cfg.CHROME149_REFERENCE_PROFILE
+        self.browser_family = "chrome" if reference_chrome else self.browser_profile_key
         if self.browser_family not in {"chrome", "firefox"}:
             raise ValueError(f"不支持的浏览器画像: {self.browser_family!r}")
         self.impersonate = (
@@ -125,13 +127,15 @@ class BrowserSession:
         # 设置超时
         self.session.timeout = REQUEST_TIMEOUT
 
-        # 仅在显式开启自动画像时探测 GeoIP；默认固定 JP，避免额外流量和画像漂移。
-        self.exit_geo = self._detect_exit_geo() if detect_exit_geo else {}
+        # 参考画像单独启用 GeoIP；不修改注册/2FA 的全局固定语言和时区配置。
+        self.exit_geo = {}
+        if detect_exit_geo:
+            self.exit_geo = self._detect_exit_geo(force=True) if reference_chrome else self._detect_exit_geo()
         self._enforce_proxy_quality()
         self.browser_profile = _browser_cfg.pick_browser_profile(
             self.exit_geo,
             proxy=self.proxy,
-            browser_family=self.browser_family,
+            browser_family=self.browser_profile_key,
         )
         self.browser_profile["react_listening_key"] = self.react_listening_key
         self.browser_profile["react_container_key"] = self.react_container_key
@@ -310,11 +314,11 @@ class BrowserSession:
                 headers["sec-ch-ua-platform"] = str(profile.get("sec_ch_ua_platform") or SEC_CH_UA_PLATFORM)
             if SEND_HIGH_ENTROPY_CLIENT_HINTS:
                 headers.update({
-                    "sec-ch-ua-full-version-list": SEC_CH_UA_FULL_VERSION_LIST,
-                    "sec-ch-ua-platform-version": SEC_CH_UA_PLATFORM_VERSION,
-                    "sec-ch-ua-arch": SEC_CH_UA_ARCH,
-                    "sec-ch-ua-bitness": SEC_CH_UA_BITNESS,
-                    "sec-ch-ua-model": SEC_CH_UA_MODEL,
+                    "sec-ch-ua-full-version-list": str(profile.get("sec_ch_ua_full_version_list") or SEC_CH_UA_FULL_VERSION_LIST),
+                    "sec-ch-ua-platform-version": str(profile.get("sec_ch_ua_platform_version") or SEC_CH_UA_PLATFORM_VERSION),
+                    "sec-ch-ua-arch": str(profile.get("sec_ch_ua_arch") or SEC_CH_UA_ARCH),
+                    "sec-ch-ua-bitness": str(profile.get("sec_ch_ua_bitness") or SEC_CH_UA_BITNESS),
+                    "sec-ch-ua-model": str(profile.get("sec_ch_ua_model") or SEC_CH_UA_MODEL),
                 })
         return headers
 
@@ -619,3 +623,9 @@ class BrowserSession:
         headers = self._attach_openai_target_headers_for_url(url, headers)
         resp = self.session.delete(url, headers=headers, **kwargs)
         return self._observe_response(resp, url, "DELETE")
+
+    def patch(self, url: str, headers: dict = None, **kwargs):
+        """发送 PATCH 请求，保留与其他请求相同的目标头及响应观测。"""
+        headers = self._attach_openai_target_headers_for_url(url, headers)
+        resp = self.session.patch(url, headers=headers, **kwargs)
+        return self._observe_response(resp, url, "PATCH")

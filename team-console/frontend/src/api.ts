@@ -1,4 +1,7 @@
 import axios from 'axios';
+import type { InternalAxiosRequestConfig } from 'axios';
+import { ACCESS_STORAGE_KEY, createAccessSession } from './accessSession';
+import type { AccessSnapshot } from './accessSession';
 import type { Detail } from './types';
 
 const client = axios.create({ timeout: 30_000 });
@@ -6,22 +9,20 @@ export class ApiError extends Error {
   constructor(message: string, readonly details: Detail[] = []) { super(message); }
 }
 export class InvalidAccessKeyError extends ApiError {}
-export const AUTH_EXPIRED_EVENT = 'team-console:auth-expired';
-let activeKey: string | undefined;
-export function getAccessKey() {
-  if (activeKey === undefined) {
-    try { activeKey = sessionStorage.getItem('team-console-key') || ''; }
-    catch { activeKey = ''; }
-  }
-  return activeKey;
-}
-export function setAccessKey(key: string) {
-  activeKey = key.trim();
-  try {
-    if (activeKey) sessionStorage.setItem('team-console-key', activeKey);
-    else sessionStorage.removeItem('team-console-key');
-  } catch { /* Private storage disabled: keep this tab's key in memory only. */ }
-}
+export const accessSession = createAccessSession({
+  shared: () => localStorage, legacy: () => sessionStorage,
+  external: (notify) => {
+    const changed = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== ACCESS_STORAGE_KEY) return;
+      try { if (event.storageArea !== localStorage) return; } catch { return; }
+      notify();
+    };
+    window.addEventListener('storage', changed);
+    return () => window.removeEventListener('storage', changed);
+  },
+});
+export function getAccessKey() { return accessSession.read().key; }
+type AuthenticatedRequest = InternalAxiosRequestConfig & { consoleSession?: AccessSnapshot };
 export async function verifyAccessKey(key: string, signal?: AbortSignal): Promise<void> {
   if (!key.trim()) throw new InvalidAccessKeyError('请输入访问密钥');
   try {
@@ -43,8 +44,9 @@ export async function verifyAccessKey(key: string, signal?: AbortSignal): Promis
   }
 }
 client.interceptors.request.use((config) => {
-  const key = getAccessKey();
-  if (key) config.headers.set('X-Team-Console-Key', key);
+  const snapshot = accessSession.read();
+  (config as AuthenticatedRequest).consoleSession = snapshot;
+  if (snapshot.key) config.headers.set('X-Team-Console-Key', snapshot.key);
   return config;
 });
 // Never replay POST/PATCH/DELETE after timeouts or authentication failures.
@@ -56,11 +58,8 @@ client.interceptors.response.use((response) => {
   // Upstream Team credentials can also return 401. Only our own API guard's
   // explicit code invalidates this login; ignore stale requests from old keys.
   if (error.response?.status === 401 && error.response?.data?.code === 'access_key_invalid') {
-    const requestKey = error.config?.headers?.get('X-Team-Console-Key');
-    if (getAccessKey() && requestKey === getAccessKey()) {
-      setAccessKey('');
-      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
-    }
+    const snapshot = (error.config as AuthenticatedRequest | undefined)?.consoleSession;
+    if (snapshot) accessSession.expire(snapshot);
   }
   if (error.response?.data && typeof error.response.data === 'object') throw responseError(error.response.data);
   throw new ApiError('网络请求失败；写入操作未自动重试，请先查看任务记录');
@@ -71,8 +70,11 @@ function responseError(data: { error?: string; busy?: Detail[]; skipped?: Detail
 export async function get<T>(url: string, params?: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
   return (await client.get<T>(url, { params, signal })).data;
 }
-export async function post<T>(url: string, data?: unknown): Promise<T> {
-  return (await client.post<T>(url, data)).data;
+export async function post<T>(url: string, data?: unknown, options?: { timeout?: number; signal?: AbortSignal }): Promise<T> {
+  return (await client.post<T>(url, data, options)).data;
+}
+export async function deleteResource<T>(url: string, data?: unknown): Promise<T> {
+  return (await client.delete<T>(url, { data })).data;
 }
 export function saveDownload(data: unknown, filename: string) {
   saveBlob(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }), filename);

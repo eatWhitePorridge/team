@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
-import { Alert, Button, Card, Form, Input, Select, Tag, Typography } from 'antd';
-import { ReloadOutlined } from '@ant-design/icons';
+import { Alert, Button, Card, Form, Input, Select, Typography } from 'antd';
+import { CloudServerOutlined, ReloadOutlined } from '@ant-design/icons';
 import { post } from '../api';
 import { RequestError } from '../components';
 import { useAction, useResource } from '../hooks';
@@ -22,9 +22,9 @@ export default function Network() {
     form.resetFields(); form.setFieldsValue({ quota_proxy_mode: result.settings.quota_proxy_mode });
     data.reload(); void action.message.success('已保存，新会话立即生效');
   });
-  return <Card className="data-card settings-card">
+  return <div className="bento-grid network-grid"><Card className="data-card settings-card bento-wide">
     <RequestError value={data.error} />
-    <div className="settings-heading"><div><Typography.Title level={4}>代理池</Typography.Title><span className="muted">已配置 <strong>{settings?.pool_count ?? '—'}</strong> 条</span>{settings && <Tag>{settings.source === 'deployment' ? '部署配置' : '自定义'}</Tag>}</div><Button aria-label="刷新代理状态" icon={<ReloadOutlined />} onClick={data.reload} loading={data.loading} /></div>
+    <div className="settings-heading"><Typography.Title level={4}>代理设置</Typography.Title><Button aria-label="刷新代理状态" icon={<ReloadOutlined />} onClick={data.reload} loading={data.loading} /></div>
     <Form form={form} layout="vertical" onFinish={(values) => void save(values)} onFinishFailed={({ errorFields }) => {
       if (quotaSection.current && errorFields.some((field) => String(field.name[0]).startsWith('quota_'))) quotaSection.current.open = true;
     }} initialValues={{ pool_action: 'keep', quota_proxy_action: 'keep' }} disabled={action.pending || !settings || !!data.error} className="network-form">
@@ -40,8 +40,13 @@ export default function Network() {
         {quotaAction === 'replace' && <Form.Item name="quota_proxy" label="专用代理地址" rules={[{ required: true, whitespace: true }]}><Input.Password autoComplete="off" /></Form.Item>}
         {quotaAction === 'clear' && <Typography.Paragraph type="warning">保存后移除专用代理，代理模式改用代理池。</Typography.Paragraph>}
       </div></details>
-      <div className="settings-footer"><Button type="primary" htmlType="submit" loading={action.pending} disabled={!settings || !!data.error}>保存配置</Button><Typography.Text type="secondary">仅对新会话生效</Typography.Text></div>
-      <details className="inline-details settings-help"><summary>使用说明</summary><p className="muted details-body">母号管理和两种授权共用代理池。修改独立保存，不影响旧系统或正在执行的连接；保留当前配置不会覆盖已有代理。</p></details>
+      <div className="settings-footer"><Button type="primary" htmlType="submit" loading={action.pending} disabled={!settings || !!data.error}>保存配置</Button><Typography.Text type="secondary">新会话生效</Typography.Text></div>
     </Form>
-  </Card>;
+  </Card>
+    <section className="bento-tile network-summary bento-wide">
+      <div className="tile-heading"><h2>代理池</h2><span className="tile-icon" aria-hidden="true"><CloudServerOutlined /></span></div>
+      <div className="network-pool-count"><strong className="bento-value">{settings?.pool_count ?? '—'}</strong><span className="muted">条</span></div>
+      <dl className="settings-facts"><div><dt>额度连接</dt><dd>{settings ? routes[settings.quota_proxy_mode] || settings.quota_proxy_mode : '—'}</dd></div><div><dt>额度专用代理</dt><dd>{settings ? settings.quota_proxy_configured ? '已设置' : '未设置' : '—'}</dd></div><div><dt>配置来源</dt><dd>{settings ? settings.source === 'deployment' ? '部署配置' : '自定义' : '—'}</dd></div></dl>
+    </section>
+  </div>;
 }
